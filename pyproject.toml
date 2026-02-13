@@ -1,6 +1,6 @@
 [project]
 name = "auth0-oauth-client"
-version = "0.1.0"
+version = "0.2.0"
 description = "A Django-focused Auth0 integration providing automated OIDC flows, account linking, and so on."
 authors = [
     {name = "Tinuvi", email = "no-reply@tinuvi.com"}
