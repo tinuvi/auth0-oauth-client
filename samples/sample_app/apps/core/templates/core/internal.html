@@ -1,0 +1,541 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Dashboard - Connected Accounts</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #f5f5f5;
+      color: #333;
+      min-height: 100vh;
+    }
+    header {
+      background: #fff;
+      border-bottom: 1px solid #e0e0e0;
+      padding: 16px 32px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    header h1 { font-size: 20px; }
+    .user-info {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+    .user-info span { color: #666; font-size: 14px; }
+    .btn {
+      display: inline-block;
+      padding: 8px 20px;
+      border-radius: 6px;
+      font-size: 14px;
+      font-weight: 500;
+      text-decoration: none;
+      cursor: pointer;
+      border: none;
+      transition: background 0.2s;
+    }
+    .btn-primary { background: #635dff; color: #fff; }
+    .btn-primary:hover { background: #4a44cc; }
+    .btn-danger { background: #e53e3e; color: #fff; }
+    .btn-danger:hover { background: #c53030; }
+    .btn-outline {
+      background: transparent;
+      color: #635dff;
+      border: 1px solid #635dff;
+    }
+    .btn-outline:hover { background: #f0efff; }
+    main { max-width: 800px; margin: 32px auto; padding: 0 16px; }
+    .card {
+      background: #fff;
+      border-radius: 8px;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+      padding: 24px;
+      margin-bottom: 24px;
+    }
+    .card h2 {
+      font-size: 18px;
+      margin-bottom: 16px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid #eee;
+    }
+    .empty { color: #999; font-style: italic; padding: 12px 0; }
+    .loading { color: #999; padding: 12px 0; }
+    .error { color: #e53e3e; padding: 12px 0; }
+
+    /* User profile */
+    .user-profile {
+      display: flex;
+      gap: 24px;
+      align-items: flex-start;
+    }
+    .avatar {
+      width: 80px;
+      height: 80px;
+      border-radius: 50%;
+      object-fit: cover;
+      flex-shrink: 0;
+    }
+    .profile-details { flex: 1; }
+    .profile-row {
+      display: flex;
+      padding: 6px 0;
+      border-bottom: 1px solid #f5f5f5;
+    }
+    .profile-row:last-child { border-bottom: none; }
+    .profile-row .label {
+      font-weight: 600;
+      color: #666;
+      width: 120px;
+      flex-shrink: 0;
+      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .profile-row .value {
+      word-break: break-all;
+    }
+    .monospace {
+      font-family: "SF Mono", Monaco, "Cascadia Code", monospace;
+      font-size: 13px;
+    }
+
+    /* Accounts & connections */
+    .account-item, .connection-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 0;
+      border-bottom: 1px solid #f0f0f0;
+    }
+    .account-item:last-child, .connection-item:last-child { border-bottom: none; }
+    .account-details { flex: 1; }
+    .account-details .connection-name {
+      font-weight: 600;
+      font-size: 15px;
+      margin-bottom: 2px;
+    }
+    .account-details .account-id {
+      color: #999;
+      font-size: 12px;
+      font-family: monospace;
+    }
+    .connection-name { font-weight: 500; }
+
+    /* Modal */
+    .modal-overlay {
+      display: none;
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0,0,0,0.4);
+      z-index: 1000;
+      align-items: center;
+      justify-content: center;
+    }
+    .modal-overlay.active { display: flex; }
+    .modal-content {
+      background: #fff;
+      border-radius: 8px;
+      box-shadow: 0 4px 24px rgba(0,0,0,0.2);
+      padding: 24px;
+      max-width: 600px;
+      width: 90%;
+      max-height: 80vh;
+      overflow-y: auto;
+    }
+    .modal-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 16px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid #eee;
+    }
+    .modal-header h3 { font-size: 16px; }
+    .btn-close {
+      background: none;
+      border: none;
+      font-size: 24px;
+      cursor: pointer;
+      color: #999;
+      padding: 0 4px;
+    }
+    .btn-close:hover { color: #333; }
+    .token-value {
+      word-break: break-all;
+      background: #f8f8f8;
+      padding: 8px;
+      border-radius: 4px;
+      display: block;
+      margin-top: 4px;
+    }
+
+    /* Code block */
+    .code-block {
+      background: #1e1e2e;
+      border-radius: 6px;
+      overflow-x: auto;
+      margin: 0;
+      padding: 0;
+    }
+    .code-block table {
+      border-collapse: collapse;
+      width: 100%;
+    }
+    .code-block td {
+      padding: 0;
+      vertical-align: top;
+      font-family: "SF Mono", Monaco, "Cascadia Code", monospace;
+      font-size: 13px;
+      line-height: 1.6;
+    }
+    .code-block .line-numbers {
+      width: 1px;
+      white-space: nowrap;
+      padding: 16px 12px;
+      text-align: right;
+      color: #666;
+      user-select: none;
+      border-right: 1px solid #333;
+    }
+    .code-block .code-content {
+      padding: 16px;
+      color: #cdd6f4;
+      white-space: pre;
+    }
+    .code-block .json-key { color: #89b4fa; }
+    .code-block .json-string { color: #f9e2af; }
+    .code-block .json-bool { color: #94e2d5; }
+    .code-block .json-number { color: #94e2d5; }
+  </style>
+</head>
+<body>
+  {% csrf_token %}
+
+  <header>
+    <h1>Connected Accounts</h1>
+    <div class="user-info">
+      <span>{{ user_info.name|default:user_info.email }}</span>
+      <a href="/auth/logout/" class="btn btn-outline">Log out</a>
+    </div>
+  </header>
+
+  <main>
+    <div class="card">
+      <h2>User Profile</h2>
+      <div class="user-profile">
+        {% if user_info.picture %}
+        <img src="{{ user_info.picture }}" alt="Profile" class="avatar">
+        {% endif %}
+        <div class="profile-details">
+          {% if user_info.name %}
+          <div class="profile-row">
+            <span class="label">Name</span>
+            <span class="value">{{ user_info.name }}</span>
+          </div>
+          {% endif %}
+          {% if user_info.email %}
+          <div class="profile-row">
+            <span class="label">Email</span>
+            <span class="value">{{ user_info.email }}</span>
+          </div>
+          {% endif %}
+          {% if user_info.user_id %}
+          <div class="profile-row">
+            <span class="label">User ID</span>
+            <span class="value monospace">{{ user_info.user_id }}</span>
+          </div>
+          {% endif %}
+          {% if user_info.nickname %}
+          <div class="profile-row">
+            <span class="label">Nickname</span>
+            <span class="value">{{ user_info.nickname }}</span>
+          </div>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Identities</h2>
+      {{ user_info.identities|json_script:"identities-data" }}
+      <div class="code-block" id="identities-block"></div>
+      <div style="display: flex; align-items: center; gap: 12px; margin-top: 16px; padding-top: 12px; border-top: 1px solid #eee;">
+        <input
+          type="text"
+          id="force-consent-connection"
+          value="google-oauth2"
+          placeholder="Connection"
+          style="padding: 8px 12px; border: 1px solid #ddd; border-radius: 6px; font-size: 14px; flex: 1;"
+        >
+        <input
+          type="text"
+          id="force-consent-scopes"
+          placeholder="e.g. scope1, scope2"
+          style="padding: 8px 12px; border: 1px solid #ddd; border-radius: 6px; font-size: 14px; flex: 1;"
+        >
+        <button class="btn btn-primary" onclick="forceConsent()">Force consent</button>
+      </div>
+    </div>
+
+    <div class="card" id="connections-card">
+      <h2>Available Connections</h2>
+      <div id="connections-list">
+        <p class="loading">Loading available connections...</p>
+      </div>
+    </div>
+
+    <div class="card" id="accounts-card">
+      <h2>Your Connected Accounts</h2>
+      <div id="accounts-list">
+        <p class="loading">Loading connected accounts...</p>
+      </div>
+    </div>
+  </main>
+
+  <div id="token-modal" class="modal-overlay" onclick="if(event.target===this)closeModal()">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3 id="modal-title">Access Token</h3>
+        <button onclick="closeModal()" class="btn-close">&times;</button>
+      </div>
+      <div id="modal-body"></div>
+    </div>
+  </div>
+
+  <script>
+    var csrfToken = document.querySelector("[name=csrfmiddlewaretoken]").value;
+
+    // ── Helpers ──────────────────────────────────────────────────
+
+    function escapeHtml(text) {
+      var d = document.createElement("div");
+      d.textContent = text;
+      return d.innerHTML;
+    }
+
+    function renderError(container, message) {
+      container.innerHTML = '<p class="error">' + escapeHtml(message) + "</p>";
+    }
+
+    // ── Modal ────────────────────────────────────────────────────
+
+    function openModal(title, bodyHtml) {
+      document.getElementById("modal-title").textContent = title;
+      document.getElementById("modal-body").innerHTML = bodyHtml;
+      document.getElementById("token-modal").classList.add("active");
+    }
+
+    function closeModal() {
+      document.getElementById("token-modal").classList.remove("active");
+    }
+
+    // ── Connected Accounts ──────────────────────────────────────
+
+    async function loadAccounts() {
+      var container = document.getElementById("accounts-list");
+      try {
+        var res = await fetch("/auth/connected-accounts/");
+        if (!res.ok) throw new Error("Failed to load connected accounts");
+        var data = await res.json();
+        var accounts = data.accounts || data || [];
+        if (accounts.length === 0) {
+          container.innerHTML = '<p class="empty">No connected accounts yet.</p>';
+          return;
+        }
+        container.innerHTML = accounts
+          .map(function (account) {
+            return (
+              '<div class="account-item">' +
+              '  <div class="account-details">' +
+              '    <div class="connection-name">' +
+              escapeHtml(account.connection || "Unknown") +
+              "    </div>" +
+              '    <div class="account-id">' +
+              escapeHtml(account.id || "") +
+              "    </div>" +
+              "  </div>" +
+              '  <button class="btn btn-danger" onclick="deleteAccount(\'' +
+              escapeHtml(account.id) +
+              "')\">" +
+              "    Disconnect" +
+              "  </button>" +
+              "</div>"
+            );
+          })
+          .join("");
+      } catch (err) {
+        renderError(container, err.message);
+      }
+    }
+
+    async function deleteAccount(accountId) {
+      if (!confirm("Disconnect this account?")) return;
+      try {
+        var res = await fetch("/auth/connected-accounts/" + accountId + "/", {
+          method: "DELETE",
+          headers: { "X-CSRFToken": csrfToken },
+        });
+        if (!res.ok) throw new Error("Failed to delete connected account");
+        loadAccounts();
+      } catch (err) {
+        alert(err.message);
+      }
+    }
+
+    // ── Available Connections ───────────────────────────────────
+
+    async function loadConnections() {
+      var container = document.getElementById("connections-list");
+      try {
+        var res = await fetch("/auth/connected-accounts/connections/");
+        if (!res.ok) throw new Error("Failed to load connections");
+        var data = await res.json();
+        var connections = data.connections || data || [];
+        if (connections.length === 0) {
+          container.innerHTML = '<p class="empty">No connections available.</p>';
+          return;
+        }
+        container.innerHTML = connections
+          .map(function (conn) {
+            var name = conn.name || conn.connection || conn;
+            return (
+              '<div class="connection-item">' +
+              '  <span class="connection-name">' + escapeHtml(name) + "</span>" +
+              '  <button class="btn btn-primary" onclick="spyToken(\'' +
+              escapeHtml(name) +
+              "')\">" +
+              "    Check Token" +
+              "  </button>" +
+              "</div>"
+            );
+          })
+          .join("");
+      } catch (err) {
+        renderError(container, err.message);
+      }
+    }
+
+    // ── Spy Access Token ────────────────────────────────────────
+
+    async function spyToken(connection) {
+      openModal(
+        "Access Token for " + connection,
+        '<p class="loading">Loading...</p>'
+      );
+      try {
+        var res = await fetch(
+          "/spy-access-token-for-connection/?connection=" +
+            encodeURIComponent(connection)
+        );
+        var data = await res.json();
+        if (!res.ok) {
+          var html =
+            '<p class="error">' +
+            escapeHtml(data.error || "Failed to get token") +
+            "</p>";
+          if (data.connect_url) {
+            html +=
+              '<a href="' +
+              escapeHtml(data.connect_url) +
+              '" class="btn btn-primary" style="margin-top: 12px; display: inline-block;">' +
+              "Connect Account</a>";
+          }
+          document.getElementById("modal-body").innerHTML = html;
+          return;
+        }
+        var html = "";
+        if (data.access_token) {
+          html +=
+            '<div class="profile-row">' +
+            '<span class="label">Access Token</span>' +
+            '<span class="value monospace token-value">' +
+            escapeHtml(data.access_token) +
+            "</span></div>";
+        }
+        if (data.expires_in != null) {
+          html +=
+            '<div class="profile-row">' +
+            '<span class="label">Expires In</span>' +
+            '<span class="value">' +
+            data.expires_in +
+            " seconds</span></div>";
+        }
+        if (data.scope) {
+          html +=
+            '<div class="profile-row">' +
+            '<span class="label">Scope</span>' +
+            '<span class="value">' +
+            escapeHtml(data.scope) +
+            "</span></div>";
+        }
+        document.getElementById("modal-body").innerHTML =
+          html || '<p class="empty">No token data returned.</p>';
+      } catch (err) {
+        document.getElementById("modal-body").innerHTML =
+          '<p class="error">' + escapeHtml(err.message) + "</p>";
+      }
+    }
+
+    // ── Identities ──────────────────────────────────────────────
+
+    (function () {
+      var raw = JSON.parse(document.getElementById("identities-data").textContent);
+      var json = JSON.stringify(raw, null, 2);
+      var lines = json.split("\n");
+      var nums = "";
+      var code = "";
+      for (var i = 0; i < lines.length; i++) {
+        nums += (i + 1) + "\n";
+        code += syntaxHighlight(lines[i]) + "\n";
+      }
+      document.getElementById("identities-block").innerHTML =
+        '<table><tr>' +
+        '<td class="line-numbers"><pre>' + nums.trimEnd() + '</pre></td>' +
+        '<td class="code-content"><pre>' + code.trimEnd() + '</pre></td>' +
+        '</tr></table>';
+    })();
+
+    function syntaxHighlight(line) {
+      return line.replace(
+        /("(?:\\.|[^"\\])*")\s*(:?)/g,
+        function (match, str, colon) {
+          if (colon) {
+            return '<span class="json-key">' + escapeHtml(str) + '</span>' + colon;
+          }
+          return '<span class="json-string">' + escapeHtml(str) + '</span>';
+        }
+      ).replace(
+        /\b(true|false)\b/g,
+        '<span class="json-bool">$1</span>'
+      ).replace(
+        /\b(\d+(?:\.\d+)?)\b/g,
+        '<span class="json-number">$1</span>'
+      );
+    }
+
+    // ── Force Consent ────────────────────────────────────────────
+
+    function forceConsent() {
+      var connection = document.getElementById("force-consent-connection").value;
+      var scopesRaw = document.getElementById("force-consent-scopes").value.trim();
+      var params = "connection=" + encodeURIComponent(connection);
+      if (scopesRaw) {
+        var scopes = scopesRaw.split(",").map(function (s) { return s.trim(); }).filter(Boolean);
+        scopes.forEach(function (scope) {
+          params += "&scopes=" + encodeURIComponent(scope);
+        });
+      }
+      window.location.href = "/custom-login/?" + params;
+    }
+
+    // ── Init ────────────────────────────────────────────────────
+
+    loadAccounts();
+    loadConnections();
+  </script>
+</body>
+</html>

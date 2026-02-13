@@ -1,0 +1,6 @@
+.coverage
+.coverage.*
+tmp
+.claude/settings.local.json
+samples/auth0_oauth_client-*
+db.sqlite3

@@ -1,0 +1,15 @@
+FROM python:3.14-slim
+
+RUN apt update && apt install -y git && apt clean
+
+WORKDIR /app
+
+RUN pip install --upgrade pip && \
+    pip install poetry && \
+    poetry config virtualenvs.create false --local
+
+COPY poetry.lock pyproject.toml auth0_oauth_client-* ./
+
+RUN poetry install --no-root
+
+COPY . ./

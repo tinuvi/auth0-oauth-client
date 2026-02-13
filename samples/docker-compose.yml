@@ -1,0 +1,18 @@
+services:
+  app:
+    env_file:
+      - .env
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - .:/app
+    command: ["./scripts/start-development.sh"]
+
+  lint-formatter:
+    env_file:
+      - .env
+    build: .
+    volumes:
+      - .:/app
+    command: ["./scripts/start-formatter-lint.sh"]

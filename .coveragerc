@@ -1,0 +1,14 @@
+[run]
+; https://coverage.readthedocs.io/en/coverage-5.5/config.html?highlight=show_missing#run
+relative_files=True
+omit =
+    .mypy_cache/*
+    tests/*
+    .venv/*
+    scripts/*
+    samples
+
+[report]
+; https://coverage.readthedocs.io/en/coverage-5.5/config.html?highlight=show_missing#report
+show_missing = True
+skip_covered = False
