@@ -8,9 +8,13 @@ Then:
 
     poetry build --output /app/samples
 
-Access the folder `samples`, use the following command to install the package:
+Get the version of the package you just built with:
 
-    poetry add --editable ./auth0_oauth_client-0.1.0.tar.gz
+    poetry version -s
+
+Access the folder `samples`. Replace the version number in the following command with the one you got above:
+
+    poetry add --editable ./auth0_oauth_client-0.3.0.tar.gz
 
 Exit the container. Access the folder `samples`, update `.env` accordingly, and run the sample app with:
 

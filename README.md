@@ -4,6 +4,10 @@ A Django-focused Auth0 integration providing automated OIDC flows, account linki
 
 It's an opinionated library focused on the needs of our own products. Feel free to fork it and adapt it to your needs.
 
+## Read this before using it
+
+This library uses `uuid7` for the ID columns when the Python version is 3.14 or higher. If you're using Python 3.12 or 3.13, it will use `uuid4` instead. If your project updates to Python 3.14, it will break. We know this behavior is unacceptable for a library. That's why we are letting you know in advance. Again, fork this library and adapt it to your needs. 
+
 ## Rules
 
 The [`sample_app`](./samples) demonstrates how to use the library. It implements the following rules:

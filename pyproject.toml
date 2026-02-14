@@ -1,6 +1,6 @@
 [project]
 name = "auth0-oauth-client"
-version = "0.2.0"
+version = "0.3.0"
 description = "A Django-focused Auth0 integration providing automated OIDC flows, account linking, and so on."
 authors = [
     {name = "Tinuvi", email = "no-reply@tinuvi.com"}
@@ -16,7 +16,7 @@ repository = "https://github.com/tinuvi/auth0-oauth-client"
 "Bug Tracker" = "https://github.com/tinuvi/auth0-oauth-client/issues"
 
 [tool.poetry.dependencies]
-python = "^3.14"
+python = "^3.12"
 django = "^5.2.9"
 requests = "^2.32.5"
 pyjwt = "^2.7.0"

@@ -6,7 +6,7 @@ package-mode = false
 python = "^3.14"
 django = "^5.2.9"
 requests = "*"
-auth0-oauth-client = {path = "auth0_oauth_client-0.1.0.tar.gz", develop = true}
+auth0-oauth-client = {path = "auth0_oauth_client-0.3.0.tar.gz", develop = true}
 
 [tool.poetry.group.dev.dependencies]
 pre-commit = "*"

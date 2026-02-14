@@ -197,14 +197,14 @@ files = [
 ]
 
 [[package]]
-name = "auth0_oauth_client"
-version = "0.1.0"
-description = "A Django-focused Auth0 integration providing automated OIDC flows, account linking, and backchannel logout."
+name = "auth0-oauth-client"
+version = "0.3.0"
+description = "A Django-focused Auth0 integration providing automated OIDC flows, account linking, and so on."
 optional = false
-python-versions = ">=3.14,<4.0"
+python-versions = ">=3.12,<4.0"
 groups = ["main"]
 files = [
-    {file = "auth0_oauth_client-0.1.0.tar.gz", hash = "sha256:b3852104b77866108bffd5a9b8f6666e1c4a334ec6b5dbe22eb5ea34f47901f0"},
+    {file = "auth0_oauth_client-0.3.0.tar.gz", hash = "sha256:d4b67968ec702695c634315fd1f0bb7118178984bd4d2478220d95a81c38553e"},
 ]
 
 [package.dependencies]
@@ -215,7 +215,7 @@ requests = ">=2.32.5,<3.0.0"
 
 [package.source]
 type = "file"
-url = "auth0_oauth_client-0.1.0.tar.gz"
+url = "auth0_oauth_client-0.3.0.tar.gz"
 
 [[package]]
 name = "auth0-python"
@@ -1456,4 +1456,4 @@ propcache = ">=0.2.1"
 [metadata]
 lock-version = "2.1"
 python-versions = "^3.14"
-content-hash = "309965394092e12dd73211fc47d6ac0c67c483ecf6762f8a5d13a3633f941833"
+content-hash = "58842ffc15beee95d876c63819c381efec2a8b191c99f35cc16cc42d425a4751"

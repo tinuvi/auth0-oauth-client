@@ -1,10 +1,13 @@
-import uuid
-
 from django.db import models
+
+try:
+    from uuid import uuid7 as default_uuid
+except:  # noqa: B001,E722
+    from uuid import uuid4 as default_uuid
 
 
 class _StandardModelMixin(models.Model):
-    id = models.UUIDField(primary_key=True, default=uuid.uuid7, editable=False, verbose_name="Id")
+    id = models.UUIDField(primary_key=True, default=default_uuid, editable=False, verbose_name="Id")
     created_at = models.DateTimeField(auto_now_add=True, editable=False, verbose_name="Created at")
     updated_at = models.DateTimeField(auto_now=True, editable=False, verbose_name="Updated at")
 
