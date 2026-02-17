@@ -3,20 +3,36 @@ from typing import NotRequired
 from typing import TypedDict
 
 
-class UserinfoPayload(TypedDict):
-    aud: str
+class AddressPayload(TypedDict, total=False):
+    country: str
+
+
+class UserinfoPayload(TypedDict, total=False):
+    sub: str
+    name: str
+    given_name: str
+    family_name: str
+    middle_name: str
+    nickname: str
+    preferred_username: str
+    profile: str
+    picture: str
+    website: str
     email: str
     email_verified: bool
+    gender: str
+    birthdate: str
+    zoneinfo: str
+    locale: str
+    phone_number: str
+    phone_number_verified: bool
+    address: AddressPayload
+    updated_at: int
+    aud: str
     exp: int
-    given_name: str
     iat: int
     iss: str
-    name: str
-    nickname: str
-    picture: str
     sid: str
-    sub: str
-    updated_at: str
 
 
 class TokenResponse(TypedDict):
@@ -62,9 +78,50 @@ class CompleteConnectedAccountRequestBody(TypedDict):
     code_verifier: str
 
 
-class IdentityResponseBody(TypedDict):
+class IdentityProfileData(TypedDict, total=False):
+    email: str
+    email_verified: bool
+    name: str
+    username: str
+    given_name: str
+    phone_number: str
+    phone_verified: bool
+    family_name: str
+
+
+class IdentityResponseBody(TypedDict, total=False):
     connection: str
+    user_id: str
     provider: str
+    isSocial: bool
+    access_token: str
+    access_token_secret: str
+    refresh_token: str
+    profileData: IdentityProfileData
+
+
+class UserDetailsPayload(TypedDict, total=False):
+    user_id: str
+    email: str
+    email_verified: bool
+    username: str
+    phone_number: str
+    phone_verified: bool
+    created_at: str
+    updated_at: str
+    identities: list[IdentityResponseBody]
+    app_metadata: dict
+    user_metadata: dict
+    picture: str
+    name: str
+    nickname: str
+    multifactor: list[str]
+    last_ip: str
+    last_login: str
+    logins_count: int
+    blocked: bool
+    given_name: str
+    family_name: str
 
 
 class SearchUserResponseBody(TypedDict):

@@ -478,11 +478,11 @@ class VerifyAccountLinkingTest(TransactionTestCase):
         request.session[DjangoAuthClient.SESSION_KEY_STATE] = _make_session_data(user_id=user_id)
         return client, request
 
-    @patch.object(DjangoAuthClient, "get_user_info")
-    def test_linked_via_connected_account_entry(self, mock_get_user_info):
+    @patch.object(DjangoAuthClient, "get_user_by_id")
+    def test_linked_via_connected_account_entry(self, mock_get_user_by_id):
         user_id = "auth0|user1"
         primary_user_id = "auth0|primary"
-        mock_get_user_info.return_value = {
+        mock_get_user_by_id.return_value = {
             "email": "user@example.com",
             "identities": [{"provider": "google-oauth2", "connection": "google-oauth2"}],
         }
@@ -509,11 +509,11 @@ class VerifyAccountLinkingTest(TransactionTestCase):
         self.assertEqual(session_data["userinfo"]["sub"], primary_user_id)
 
     @patch.object(DjangoAuthClient, "_search_users_excluding_connection")
-    @patch.object(DjangoAuthClient, "get_user_info")
-    def test_auto_links_social_provider(self, mock_get_user_info, mock_search):
+    @patch.object(DjangoAuthClient, "get_user_by_id")
+    def test_auto_links_social_provider(self, mock_get_user_by_id, mock_search):
         user_id = "google-oauth2|newuser"
         existing_user_id = "auth0|existing"
-        mock_get_user_info.return_value = {
+        mock_get_user_by_id.return_value = {
             "email": "user@example.com",
             "identities": [{"provider": "google-oauth2", "connection": "google-oauth2"}],
         }
@@ -534,11 +534,11 @@ class VerifyAccountLinkingTest(TransactionTestCase):
         self.assertTrue(result["is_account_linked"])
 
     @patch.object(DjangoAuthClient, "_search_users_excluding_connection")
-    @patch.object(DjangoAuthClient, "get_user_info")
-    def test_pending_linking_for_non_social_provider(self, mock_get_user_info, mock_search):
+    @patch.object(DjangoAuthClient, "get_user_by_id")
+    def test_pending_linking_for_non_social_provider(self, mock_get_user_by_id, mock_search):
         user_id = "auth0|newuser"
         existing_user_id = "google-oauth2|existing"
-        mock_get_user_info.return_value = {
+        mock_get_user_by_id.return_value = {
             "email": "user@example.com",
             "identities": [{"provider": "auth0", "connection": "Username-Password-Authentication"}],
         }
@@ -559,9 +559,9 @@ class VerifyAccountLinkingTest(TransactionTestCase):
         self.assertEqual(pending["secondary_user_id"], user_id)
 
     @patch.object(DjangoAuthClient, "_search_users_excluding_connection")
-    @patch.object(DjangoAuthClient, "get_user_info")
-    def test_no_linking_when_no_existing_accounts(self, mock_get_user_info, mock_search):
-        mock_get_user_info.return_value = {
+    @patch.object(DjangoAuthClient, "get_user_by_id")
+    def test_no_linking_when_no_existing_accounts(self, mock_get_user_by_id, mock_search):
+        mock_get_user_by_id.return_value = {
             "email": "user@example.com",
             "identities": [{"provider": "auth0", "connection": "Username-Password-Authentication"}],
         }
@@ -573,9 +573,9 @@ class VerifyAccountLinkingTest(TransactionTestCase):
         self.assertFalse(result["is_pending_account_linking"])
         self.assertFalse(result["is_account_linked"])
 
-    @patch.object(DjangoAuthClient, "get_user_info")
-    def test_no_linking_when_all_identities_present(self, mock_get_user_info):
-        mock_get_user_info.return_value = {
+    @patch.object(DjangoAuthClient, "get_user_by_id")
+    def test_no_linking_when_all_identities_present(self, mock_get_user_by_id):
+        mock_get_user_by_id.return_value = {
             "email": "user@example.com",
             "identities": [
                 {"provider": "auth0", "connection": "auth0"},
@@ -892,7 +892,10 @@ class SessionManagementTest(TestCase):
         self.assertIsNone(result)
 
 
-class GetUserInfoTest(TestCase):
+class GetUserByIdTest(TestCase):
+    def setUp(self):
+        cache.clear()
+
     @patch.object(DjangoAuthClient, "_get_auth0_token_through_m2m")
     @patch("auth0_oauth_client.client.Auth0")
     def test_fetches_user_info(self, mock_auth0_cls, mock_m2m):
@@ -905,8 +908,68 @@ class GetUserInfoTest(TestCase):
         mock_auth0_cls.return_value = mock_auth0_instance
 
         client = DjangoAuthClient()
-        result = client.get_user_info("auth0|user1")
+        result = client.get_user_by_id("auth0|user1")
         self.assertEqual(result["user_id"], "auth0|user1")
+
+    @patch.object(DjangoAuthClient, "_get_auth0_token_through_m2m")
+    @patch("auth0_oauth_client.client.Auth0")
+    def test_returns_cached_result_on_second_call(self, mock_auth0_cls, mock_m2m):
+        mock_m2m.return_value = {"access_token": "m2m_at"}
+        mock_auth0_instance = MagicMock()
+        mock_auth0_instance.users.get.return_value = {
+            "user_id": "auth0|user1",
+            "email": "user@example.com",
+        }
+        mock_auth0_cls.return_value = mock_auth0_instance
+
+        client = DjangoAuthClient()
+        client.get_user_by_id("auth0|user1")
+        client.get_user_by_id("auth0|user1")
+
+        mock_auth0_instance.users.get.assert_called_once()
+
+    @patch.object(DjangoAuthClient, "_get_auth0_token_through_m2m")
+    @patch("auth0_oauth_client.client.Auth0")
+    def test_cache_is_invalidated_after_update_user(self, mock_auth0_cls, mock_m2m):
+        mock_m2m.return_value = {"access_token": "m2m_at"}
+        mock_auth0_instance = MagicMock()
+        mock_auth0_instance.users.get.side_effect = [
+            {"user_id": "auth0|user1", "email": "old@example.com"},
+            {"user_id": "auth0|user1", "email": "new@example.com"},
+        ]
+        mock_auth0_instance.users.update.return_value = {"user_id": "auth0|user1"}
+        mock_auth0_cls.return_value = mock_auth0_instance
+
+        client = DjangoAuthClient()
+        first = client.get_user_by_id("auth0|user1")
+        self.assertEqual(first["email"], "old@example.com")
+
+        client._update_user("auth0|user1", {"email": "new@example.com"})
+
+        second = client.get_user_by_id("auth0|user1")
+        self.assertEqual(second["email"], "new@example.com")
+        self.assertEqual(mock_auth0_instance.users.get.call_count, 2)
+
+
+class GetUserInfoTest(TestCase):
+    def test_returns_userinfo_from_session(self):
+        client = DjangoAuthClient()
+        request = _make_request_with_session()
+        userinfo = {"sub": "auth0|user1", "email": "user@example.com", "name": "Test"}
+        request.session[DjangoAuthClient.SESSION_KEY_STATE] = {
+            "userinfo": userinfo,
+            "refresh_token": "rt_123",
+        }
+
+        result = client.get_user_info(request)
+        self.assertEqual(result, userinfo)
+
+    def test_returns_none_when_no_session(self):
+        client = DjangoAuthClient()
+        request = _make_request_with_session()
+
+        result = client.get_user_info(request)
+        self.assertIsNone(result)
 
 
 class SearchUsersExcludingConnectionTest(TestCase):
@@ -962,9 +1025,9 @@ class LinkUserAccountsTest(TestCase):
 class MergeAndLinkAccountsTest(TestCase):
     @patch.object(DjangoAuthClient, "_link_user_accounts", return_value=[{"provider": "google-oauth2"}])
     @patch.object(DjangoAuthClient, "_update_user")
-    @patch.object(DjangoAuthClient, "get_user_info")
-    def test_merges_metadata_and_links(self, mock_get_user_info, mock_update, mock_link):
-        mock_get_user_info.side_effect = [
+    @patch.object(DjangoAuthClient, "get_user_by_id")
+    def test_merges_metadata_and_links(self, mock_get_user_by_id, mock_update, mock_link):
+        mock_get_user_by_id.side_effect = [
             {"user_metadata": {"key1": "val1"}, "app_metadata": {"a1": "v1"}},
             {"user_metadata": {"key2": "val2"}, "app_metadata": {"a2": "v2"}},
         ]
@@ -978,9 +1041,9 @@ class MergeAndLinkAccountsTest(TestCase):
 
     @patch.object(DjangoAuthClient, "_link_user_accounts", return_value=[])
     @patch.object(DjangoAuthClient, "_update_user")
-    @patch.object(DjangoAuthClient, "get_user_info")
-    def test_skips_update_when_no_metadata(self, mock_get_user_info, mock_update, mock_link):
-        mock_get_user_info.side_effect = [
+    @patch.object(DjangoAuthClient, "get_user_by_id")
+    def test_skips_update_when_no_metadata(self, mock_get_user_by_id, mock_update, mock_link):
+        mock_get_user_by_id.side_effect = [
             {},
             {},
         ]

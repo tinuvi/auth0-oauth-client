@@ -363,12 +363,24 @@ result = auth_client.get_access_token_for_connection_using_user_refresh_token(
 
 ---
 
-#### `auth_client.get_user_info(user_id: str) -> dict`
+#### `auth_client.get_user_by_id(user_id: str) -> dict`
 
-Fetches the full user profile from the Auth0 Management API using an M2M (client credentials) token. The M2M token is cached automatically.
+Fetches the full user profile from the Auth0 Management API using an M2M (client credentials) token. The M2M token is cached automatically. Results are cached for 24 hours and invalidated when `_update_user` is called for the same user.
 
 | Parameter | Type  | Description                                 |
 |-----------|-------|---------------------------------------------|
 | `user_id` | `str` | The Auth0 user ID (e.g. `"auth0\|abc123"`). |
 
 **Returns:** Full Auth0 user profile dict including `identities`, `email`, `user_metadata`, etc.
+
+---
+
+#### `auth_client.get_user_info(request) -> dict | None`
+
+Returns the `userinfo` payload from the current session, or `None` if no session exists.
+
+| Parameter | Type          | Description          |
+|-----------|---------------|----------------------|
+| `request` | `HttpRequest` | The Django request.  |
+
+**Returns:** The `userinfo` dict from the session (decoded from the ID token at login), or `None`.

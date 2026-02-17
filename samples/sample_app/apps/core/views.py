@@ -30,7 +30,7 @@ def welcome_page(request: HttpRequest):
 @require_GET
 @login_required
 def internal_page(request: HttpRequest):
-    user_info = auth_client.get_user_info(request.user.youruser.idp_username)
+    user_info = auth_client.get_user_by_id(request.user.youruser.idp_username)
     return render(request, "core/internal.html", {"user_info": user_info})
 
 
