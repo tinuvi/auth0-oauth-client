@@ -37,6 +37,8 @@ from auth0_oauth_client.typing import CompleteAccountLinkingResult
 from auth0_oauth_client.typing import ConnectedAccountResponse
 from auth0_oauth_client.typing import GoogleTokenResult
 from auth0_oauth_client.typing import SearchUserResponseBody
+from auth0_oauth_client.typing import UserDetailsPayload
+from auth0_oauth_client.typing import UserinfoPayload
 from auth0_oauth_client.typing import VerifyAccountLinkingResult
 
 _logger = logging.getLogger("auth0_oauth_client")
@@ -68,6 +70,12 @@ class DjangoAuthClient:
         if not session_data:
             return None
         return session_data["userinfo"]["sub"]
+
+    def get_user_info(self, request) -> UserinfoPayload | None:
+        session_data = self._get_session(request)
+        if not session_data:
+            return None
+        return session_data["userinfo"]
 
     # region Login/Logout Flow
 
@@ -321,7 +329,7 @@ class DjangoAuthClient:
                 "is_account_linked": False,
             }
         user_id = session_data["userinfo"]["sub"]
-        userinfo = self.get_user_info(user_id)
+        userinfo = self.get_user_by_id(user_id)
         user_email = userinfo["email"]
         current_account_provider = userinfo["identities"][0]["provider"]
 
@@ -422,10 +430,18 @@ class DjangoAuthClient:
         if self.SESSION_KEY_ACCOUNT_LINKING_TX in request.session:
             del request.session[self.SESSION_KEY_ACCOUNT_LINKING_TX]
 
-    def get_user_info(self, user_id: str):
+    def get_user_by_id(self, user_id: str) -> UserDetailsPayload:
+        cache_key = f"_auth0_oauth_client_user_{user_id}"
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         _tokens = self._get_auth0_token_through_m2m()
         _auth0 = Auth0(self.auth0_management_api_domain, _tokens["access_token"])
         user_details = _auth0.users.get(id=user_id)
+
+        cache.set(cache_key, user_details, timeout=60 * 60 * 24)
+
         return user_details
 
     def _search_users_excluding_connection(self, email: str, connection_name: str) -> list[SearchUserResponseBody]:
@@ -447,6 +463,7 @@ class DjangoAuthClient:
         _tokens = self._get_auth0_token_through_m2m()
         _auth0 = Auth0(self.auth0_management_api_domain, _tokens["access_token"])
         user_details = _auth0.users.update(user_id, body)
+        cache.delete(f"_auth0_oauth_client_user_{user_id}")
         return user_details
 
     def _link_user_accounts(
@@ -487,8 +504,8 @@ class DjangoAuthClient:
     def _merge_and_link_accounts(
         self, primary_user_id: str, secondary_provider: str, secondary_user_id: str
     ) -> list[dict]:
-        primary_user = self.get_user_info(primary_user_id)
-        secondary_user = self.get_user_info(secondary_user_id)
+        primary_user = self.get_user_by_id(primary_user_id)
+        secondary_user = self.get_user_by_id(secondary_user_id)
 
         primary_user_metadata = primary_user.get("user_metadata", {})
         secondary_user_metadata = secondary_user.get("user_metadata", {})
