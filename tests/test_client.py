@@ -510,6 +510,32 @@ class VerifyAccountLinkingTest(TransactionTestCase):
 
     @patch.object(DjangoAuthClient, "_search_users_excluding_connection")
     @patch.object(DjangoAuthClient, "get_user_by_id")
+    def test_skips_self_link_when_connected_account_points_to_same_user(self, mock_get_user_by_id, mock_search):
+        user_id = "google-oauth2|111"
+        mock_get_user_by_id.return_value = {
+            "email": "user@example.com",
+            "identities": [{"provider": "google-oauth2", "connection": "google-oauth2"}],
+        }
+        mock_search.return_value = []
+
+        ConnectedAccount.objects.create(
+            connected_account_id="ca_self",
+            email="user@example.com",
+            provider="google-oauth2",
+            user_id_owner=user_id,
+            is_account_linked=False,
+        )
+
+        client, request = self._setup_client_and_request(user_id=user_id)
+        result = client.verify_account_linking(request)
+
+        self.assertFalse(result["is_pending_account_linking"])
+        self.assertFalse(result["is_account_linked"])
+        ca = ConnectedAccount.objects.get(connected_account_id="ca_self")
+        self.assertFalse(ca.is_account_linked)
+
+    @patch.object(DjangoAuthClient, "_search_users_excluding_connection")
+    @patch.object(DjangoAuthClient, "get_user_by_id")
     def test_auto_links_social_provider(self, mock_get_user_by_id, mock_search):
         user_id = "google-oauth2|newuser"
         existing_user_id = "auth0|existing"

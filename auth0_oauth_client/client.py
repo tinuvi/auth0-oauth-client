@@ -335,7 +335,7 @@ class DjangoAuthClient:
 
         entries = ConnectedAccount.objects.filter(
             is_account_linked=False, email=user_email, provider=current_account_provider
-        )
+        ).exclude(user_id_owner=user_id)
         if entries.exists():
             connected_account_entry = entries.first()
             assert connected_account_entry is not None  # Tell mypy that we know that there is at least one entry
