@@ -3,6 +3,7 @@ import logging
 import time
 
 from typing import Any
+from typing import cast
 from urllib.parse import parse_qs
 from urllib.parse import urlparse
 
@@ -338,7 +339,7 @@ class DjangoAuthClient:
         ).exclude(user_id_owner=user_id)
         if entries.exists():
             connected_account_entry = entries.first()
-            assert connected_account_entry is not None  # Tell mypy that we know that there is at least one entry
+            assert connected_account_entry is not None  # noqa: S101 — type narrowing for the type checker
             primary_user_id = connected_account_entry.user_id_owner
             result = self._merge_and_link_accounts(primary_user_id, current_account_provider, user_id)
             session_data["userinfo"]["sub"] = primary_user_id
@@ -438,7 +439,7 @@ class DjangoAuthClient:
 
         _tokens = self._get_auth0_token_through_m2m()
         _auth0 = Auth0(self.auth0_management_api_domain, _tokens["access_token"])
-        user_details = _auth0.users.get(id=user_id)
+        user_details = cast(UserDetailsPayload, _auth0.users.get(id=user_id))
 
         cache.set(cache_key, user_details, timeout=60 * 60 * 24)
 
@@ -584,7 +585,7 @@ class DjangoAuthClient:
 
         is_access_token_still_valid = token_set and token_set.get("expires_at", 0) > time.time()
         if is_access_token_still_valid:
-            assert token_set is not None  # Tell mypy that we know that token_set is not None
+            assert token_set is not None  # noqa: S101 — type narrowing for the type checker
             return token_set["access_token"]
 
         # Refresh the token
@@ -616,7 +617,7 @@ class DjangoAuthClient:
             raise AccessTokenOauthClientError(
                 AccessTokenErrorCode.REFRESH_TOKEN_ERROR,
                 f"Failed to get token with refresh token: {str(e)}",
-            )
+            ) from e
 
     def _get_auth0_token_through_m2m(self):
         cache_key = "_auth0_oauth_client_m2m_token"

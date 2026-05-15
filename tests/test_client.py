@@ -728,6 +728,8 @@ class GetAccessTokenTest(TestCase):
         with self.assertRaises(AccessTokenOauthClientError) as ctx:
             client._get_access_token(request)
         self.assertEqual(ctx.exception.code, AccessTokenErrorCode.REFRESH_TOKEN_ERROR)
+        self.assertIsInstance(ctx.exception.__cause__, Exception)
+        self.assertEqual(str(ctx.exception.__cause__), "Network error")
 
     @patch("auth0_oauth_client.client.refresh_access_token")
     def test_reraises_access_token_error(self, mock_refresh):

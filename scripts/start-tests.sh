@@ -7,10 +7,8 @@ set -e
 
 REPORTS_FOLDER_PATH=tests-reports
 
-# Run the following: docker compose run remote-interpreter bash
-# Then you can explore the options by issuing: coverage run --source='.' -m unittest --help
-coverage run --source='.' -m unittest --durations 10 --verbose
-# `combine` is required because coverage creates a database file for each group of tests
+# JUnit XML is written to $REPORTS_FOLDER_PATH/junit.xml via TEST_OUTPUT_DIR / TEST_OUTPUT_FILE_NAME in tests/settings.py.
+coverage run --source='.' -m django test --durations 10 --testrunner=xmlrunner.extra.djangotestrunner.XMLTestRunner tests
 coverage report -m --fail-under=90
 coverage html -d $REPORTS_FOLDER_PATH/html
 coverage xml -o $REPORTS_FOLDER_PATH/coverage.xml

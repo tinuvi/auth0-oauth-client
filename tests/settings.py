@@ -4,6 +4,9 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 SECRET_KEY = "test-secret-key-for-unit-tests"
 
+TEST_OUTPUT_DIR = str(BASE_DIR / "tests-reports")
+TEST_OUTPUT_FILE_NAME = "junit.xml"
+
 INSTALLED_APPS = [
     "django.contrib.contenttypes",
     "django.contrib.sessions",

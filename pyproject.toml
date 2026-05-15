@@ -1,6 +1,7 @@
 [project]
 name = "auth0-oauth-client"
-version = "0.4.0"
+# Placeholder. The publication workflow runs `poetry version $TAG_NAME` to set the real version from the git tag.
+version = "0.0.0"
 description = "A Django-focused Auth0 integration providing automated OIDC flows, account linking, and so on."
 authors = [
     {name = "Tinuvi", email = "no-reply@tinuvi.com"}
@@ -23,104 +24,61 @@ pyjwt = "^2.7.0"
 auth0-python = "^4.13.0"
 
 [tool.poetry.group.dev.dependencies]
-### Format, lint, static type checker, among others
-pre-commit = "*"
 requests-mock = "*"
 coverage = "*"
 freezegun = "*"
-black = "*"
-isort = "*"
-flake8 = "*"
-flake8-bugbear = "*"
-flake8-comprehensions = "*"
+pyrefly = "~=0.64"
+ruff = "^0.15.2"
+django-stubs = "~=6.0"
+types-requests = "^2.33.0.20260408"
+unittest-xml-reporting = "~=4.0"
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]
 build-backend = "poetry.core.masonry.api"
 
-
-[tool.black]
+[tool.ruff]
 line-length = 120
-target_version = ["py312"]
-include = '\.pyi?$'
-exclude = '''
-(
-  /(
-      \.eggs
-    | \.git
-    | \.hg
-    | \.mypy_cache
-    | \.tox
-    | \.venv
-    | _build
-    | buck-out
-    | build
-    | dist
-    | samples
-  )/
-)
-'''
+target-version = "py314"
+extend-exclude = ["samples", "scripts", ".github", "**/migrations"]
 
-[tool.isort]
-force_single_line = true
-line_length = 120
-py_version = 312
-use_parentheses = true
-multi_line_output = 3
-include_trailing_comma = true
-lines_between_types = 1
-skip_glob = ["*/migrations/*", "samples/**"]
-
-[tool.mypy]
-python_version = "3.12"
-exclude = [
-    '^samples/.*',
+[tool.ruff.lint]
+select = [
+    "B", # flake8-bugbear
+    "C4", # flake8-comprehensions
+    "E", # pycodestyle errors
+    "F", # pyflakes
+    "I", # isort
+    "S", # flake8-bandit
+    "UP", # pyupgrade
+    "W", # pycodestyle warnings
+]
+ignore = [
+    "E501", # line too long, formatter will handle this
 ]
 
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106", "S107"]
+"tests/__init__.py" = ["E402"]
+"auth0_oauth_client/__init__.py" = ["F401"]
+"auth0_oauth_client/errors.py" = ["S105"]
 
-# flake8-mypy expects the two following for sensible formatting
-show_column_numbers = true
-show_error_context = false
+[tool.ruff.lint.isort]
+force-single-line = true
+lines-between-types = 1
 
-# do not follow imports (except for ones found in typeshed)
-follow_imports = "skip"
-
-# suppress errors about unsatisfied imports
-ignore_missing_imports = true
-
-# allow untyped calls as a consequence of the options above
-disallow_untyped_calls = false
-
-# allow returning Any as a consequence of the options above
-warn_return_any = false
-
-# treat Optional per PEP 484
-strict_optional = true
-
-# ensure all execution paths are returning
-warn_no_return = true
-
-# lint-style cleanliness for typing needs to be disabled; returns more errors
-# than the full run.
-warn_redundant_casts = false
-warn_unused_ignores = false
-
-# The following are off by default since they're too noisy.
-# Flip them on if you feel adventurous.
-disallow_untyped_defs = false
-check_untyped_defs = false
-
-[[tool.mypy.overrides]]
-module = "*.migrations.*"
-ignore_errors = true
-
-[[tool.mypy.overrides]]
-module = "sample_app.apps.core.views"
-disable_error_code = "union-attr"
-
-[[tool.mypy.overrides]]
-module = "auth0_oauth_client.models"
-disable_error_code = [
-    "var-annotated",
-    "attr-defined",
+[tool.pyrefly]
+python-version = "3.14"
+project-includes = ["auth0_oauth_client"]
+project-excludes = [
+    "**/migrations/**",
+    "**/__pycache__",
+    "**/*venv/**",
+    "samples/**",
 ]
+check-unannotated-defs = false
+infer-return-types = "checked"
+permissive-ignores = true
+
+[tool.pyrefly.errors]
+bad-override-param-name = false
