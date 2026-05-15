@@ -1,5 +1,8 @@
 # Auth0 OAuth Client
 
+[![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=tinuvi_auth0-oauth-client&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=tinuvi_auth0-oauth-client)
+[![Coverage](https://sonarcloud.io/api/project_badges/measure?project=tinuvi_auth0-oauth-client&metric=coverage)](https://sonarcloud.io/summary/new_code?id=tinuvi_auth0-oauth-client)
+
 A Django-focused Auth0 integration providing automated OIDC flows, account linking, and connected account (My Account API). It's been created to support the [Auth0 Token Vault](https://auth0.com/docs/secure/call-apis-on-users-behalf/token-vault) feature, which requires Connected Accounts flow.
 
 It's an opinionated library focused on the needs of our own products. Feel free to fork it and adapt it to your needs.
