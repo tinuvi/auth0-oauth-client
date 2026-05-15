@@ -4,6 +4,9 @@ import time
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
+import jwt
+import requests
+
 from django.core.cache import cache
 from django.test import RequestFactory
 from django.test import TestCase
@@ -13,6 +16,7 @@ from auth0_oauth_client.client import DjangoAuthClient
 from auth0_oauth_client.errors import AccessTokenErrorCode
 from auth0_oauth_client.errors import AccessTokenOauthClientError
 from auth0_oauth_client.errors import ApiOauthClientError
+from auth0_oauth_client.errors import Auth0PingError
 from auth0_oauth_client.errors import MissingRequiredArgumentOauthClientError
 from auth0_oauth_client.errors import MissingTransactionOauthClientError
 from auth0_oauth_client.models import AccountLinking
@@ -1078,3 +1082,250 @@ class MergeAndLinkAccountsTest(TestCase):
         client = DjangoAuthClient()
         client._merge_and_link_accounts("auth0|primary", "google-oauth2", "google-oauth2|secondary")
         mock_update.assert_not_called()
+
+
+def _make_m2m_jwt(
+    iss="https://test.auth0.com/",
+    aud="https://test.auth0.com/api/v2/",
+    scope="",
+):
+    """Build a fake M2M access token. Signature is irrelevant — ping() decodes without verification."""
+    return jwt.encode({"iss": iss, "aud": aud, "scope": scope}, key="secret", algorithm="HS256")
+
+
+def _make_token_response(jwt_token, expires_in=86400):
+    response = MagicMock()
+    response.ok = True
+    response.status_code = 200
+    response.json.return_value = {"access_token": jwt_token, "expires_in": expires_in}
+    return response
+
+
+def _make_error_response(status_code, body=None):
+    response = MagicMock()
+    response.ok = False
+    response.status_code = status_code
+    if body is None:
+        response.json.side_effect = requests.JSONDecodeError("no body", "", 0)
+        response.text = ""
+    else:
+        response.json.return_value = body
+        response.text = str(body)
+    return response
+
+
+class PingTest(TestCase):
+    M2M_CACHE_KEY = "_auth0_oauth_client_m2m_token"
+
+    def setUp(self):
+        cache.clear()
+
+    @patch("auth0_oauth_client.client.requests.post")
+    def test_happy_path_returns_ok_with_expected_keys(self, mock_post):
+        token = _make_m2m_jwt(scope="read:users update:users")
+        mock_post.return_value = _make_token_response(token, expires_in=86400)
+
+        client = DjangoAuthClient()
+        result = client.ping(required_scopes=["read:users", "update:users"])
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["expires_in"], 86400)
+        self.assertEqual(sorted(result["granted_scopes"]), ["read:users", "update:users"])
+        self.assertIsInstance(result["latency_ms"], int)
+        self.assertGreaterEqual(result["latency_ms"], 0)
+
+    @patch("auth0_oauth_client.client.requests.post")
+    def test_posts_client_credentials_to_correct_url(self, mock_post):
+        mock_post.return_value = _make_token_response(_make_m2m_jwt())
+
+        client = DjangoAuthClient()
+        client.ping()
+
+        call_kwargs = mock_post.call_args.kwargs
+        self.assertEqual(mock_post.call_args.args[0], "https://test.auth0.com/oauth/token")
+        self.assertEqual(call_kwargs["json"]["grant_type"], "client_credentials")
+        self.assertEqual(call_kwargs["json"]["client_id"], "test-client-id")
+        self.assertEqual(call_kwargs["json"]["client_secret"], "test-client-secret")
+        self.assertEqual(call_kwargs["json"]["audience"], "https://test.auth0.com/api/v2/")
+
+    @patch("auth0_oauth_client.client.requests.post")
+    def test_raises_m2m_token_on_401(self, mock_post):
+        mock_post.return_value = _make_error_response(
+            401, {"error": "access_denied", "error_description": "Unauthorized"}
+        )
+
+        client = DjangoAuthClient()
+        with self.assertRaises(Auth0PingError) as ctx:
+            client.ping()
+        self.assertEqual(ctx.exception.stage, "m2m_token")
+        self.assertEqual(ctx.exception.status_code, 401)
+
+    @patch("auth0_oauth_client.client.requests.post")
+    def test_raises_m2m_token_on_403(self, mock_post):
+        mock_post.return_value = _make_error_response(403, {"error": "access_denied"})
+
+        client = DjangoAuthClient()
+        with self.assertRaises(Auth0PingError) as ctx:
+            client.ping()
+        self.assertEqual(ctx.exception.stage, "m2m_token")
+        self.assertEqual(ctx.exception.status_code, 403)
+
+    @patch("auth0_oauth_client.client.requests.post")
+    def test_raises_m2m_token_on_timeout_without_status_code(self, mock_post):
+        mock_post.side_effect = requests.Timeout("timed out")
+
+        client = DjangoAuthClient()
+        with self.assertRaises(Auth0PingError) as ctx:
+            client.ping(timeout=2.5)
+        self.assertEqual(ctx.exception.stage, "m2m_token")
+        self.assertIsNone(ctx.exception.status_code)
+        self.assertIn("2.5", str(ctx.exception))
+
+    @patch("auth0_oauth_client.client.requests.post")
+    def test_raises_m2m_token_on_network_error(self, mock_post):
+        mock_post.side_effect = requests.ConnectionError("dns failure")
+
+        client = DjangoAuthClient()
+        with self.assertRaises(Auth0PingError) as ctx:
+            client.ping()
+        self.assertEqual(ctx.exception.stage, "m2m_token")
+        self.assertIsNone(ctx.exception.status_code)
+
+    @patch("auth0_oauth_client.client.requests.post")
+    def test_raises_m2m_token_when_response_lacks_access_token(self, mock_post):
+        response = MagicMock()
+        response.ok = True
+        response.status_code = 200
+        response.json.return_value = {"expires_in": 86400}
+        mock_post.return_value = response
+
+        client = DjangoAuthClient()
+        with self.assertRaises(Auth0PingError) as ctx:
+            client.ping()
+        self.assertEqual(ctx.exception.stage, "m2m_token")
+
+    @patch("auth0_oauth_client.client.requests.post")
+    def test_raises_token_claims_on_iss_mismatch(self, mock_post):
+        token = _make_m2m_jwt(iss="https://other.auth0.com/")
+        mock_post.return_value = _make_token_response(token)
+
+        client = DjangoAuthClient()
+        with self.assertRaises(Auth0PingError) as ctx:
+            client.ping()
+        self.assertEqual(ctx.exception.stage, "token_claims")
+        self.assertIn("iss", str(ctx.exception))
+
+    @patch("auth0_oauth_client.client.requests.post")
+    def test_raises_token_claims_on_aud_mismatch(self, mock_post):
+        token = _make_m2m_jwt(aud="https://other.auth0.com/api/v2/")
+        mock_post.return_value = _make_token_response(token)
+
+        client = DjangoAuthClient()
+        with self.assertRaises(Auth0PingError) as ctx:
+            client.ping()
+        self.assertEqual(ctx.exception.stage, "token_claims")
+        self.assertIn("aud", str(ctx.exception))
+
+    @patch("auth0_oauth_client.client.requests.post")
+    def test_aud_accepts_list_containing_expected_audience(self, mock_post):
+        token = _make_m2m_jwt(aud=["https://test.auth0.com/api/v2/", "https://test.auth0.com/userinfo"])
+        mock_post.return_value = _make_token_response(token)
+
+        client = DjangoAuthClient()
+        result = client.ping()
+        self.assertTrue(result["ok"])
+
+    @patch("auth0_oauth_client.client.requests.post")
+    def test_raises_scope_grant_with_exact_missing_scopes(self, mock_post):
+        token = _make_m2m_jwt(scope="read:users")
+        mock_post.return_value = _make_token_response(token)
+
+        client = DjangoAuthClient()
+        with self.assertRaises(Auth0PingError) as ctx:
+            client.ping(required_scopes={"read:users", "update:users", "read:user_idp_tokens"})
+        self.assertEqual(ctx.exception.stage, "scope_grant")
+        self.assertEqual(
+            ctx.exception.missing_scopes,
+            frozenset({"update:users", "read:user_idp_tokens"}),
+        )
+
+    @patch("auth0_oauth_client.client.requests.post")
+    def test_empty_required_scopes_skips_scope_check(self, mock_post):
+        token = _make_m2m_jwt(scope="")
+        mock_post.return_value = _make_token_response(token)
+
+        client = DjangoAuthClient()
+        result = client.ping()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["granted_scopes"], [])
+
+    @patch("auth0_oauth_client.client.requests.post")
+    def test_does_not_consult_existing_m2m_cache(self, mock_post):
+        cache.set(self.M2M_CACHE_KEY, {"access_token": "stale_cached_token", "expires_in": 60})
+        token = _make_m2m_jwt()
+        mock_post.return_value = _make_token_response(token)
+
+        client = DjangoAuthClient()
+        client.ping()
+
+        mock_post.assert_called_once()
+        cached = cache.get(self.M2M_CACHE_KEY)
+        self.assertEqual(cached["access_token"], "stale_cached_token")
+
+    @patch("auth0_oauth_client.client.requests.post")
+    def test_does_not_populate_m2m_cache(self, mock_post):
+        token = _make_m2m_jwt()
+        mock_post.return_value = _make_token_response(token)
+
+        client = DjangoAuthClient()
+        client.ping()
+
+        self.assertIsNone(cache.get(self.M2M_CACHE_KEY))
+
+    @patch("auth0_oauth_client.client.requests.post")
+    def test_timeout_is_passed_to_http_layer(self, mock_post):
+        token = _make_m2m_jwt()
+        mock_post.return_value = _make_token_response(token)
+
+        client = DjangoAuthClient()
+        client.ping(timeout=1.5)
+
+        self.assertEqual(mock_post.call_args.kwargs["timeout"], 1.5)
+
+    @patch("auth0_oauth_client.client.requests.post")
+    def test_raises_m2m_token_when_error_response_body_is_not_json(self, mock_post):
+        response = _make_error_response(502, body=None)
+        response.text = "<html>Bad Gateway</html>"
+        mock_post.return_value = response
+
+        client = DjangoAuthClient()
+        with self.assertRaises(Auth0PingError) as ctx:
+            client.ping()
+        self.assertEqual(ctx.exception.stage, "m2m_token")
+        self.assertEqual(ctx.exception.status_code, 502)
+
+    @patch("auth0_oauth_client.client.requests.post")
+    def test_raises_m2m_token_when_success_response_body_is_not_json(self, mock_post):
+        response = MagicMock()
+        response.ok = True
+        response.status_code = 200
+        response.json.side_effect = requests.JSONDecodeError("not json", "", 0)
+        mock_post.return_value = response
+
+        client = DjangoAuthClient()
+        with self.assertRaises(Auth0PingError) as ctx:
+            client.ping()
+        self.assertEqual(ctx.exception.stage, "m2m_token")
+
+    @patch("auth0_oauth_client.client.requests.post")
+    def test_raises_token_claims_when_access_token_is_not_a_jwt(self, mock_post):
+        response = MagicMock()
+        response.ok = True
+        response.status_code = 200
+        response.json.return_value = {"access_token": "not-a-jwt", "expires_in": 86400}
+        mock_post.return_value = response
+
+        client = DjangoAuthClient()
+        with self.assertRaises(Auth0PingError) as ctx:
+            client.ping()
+        self.assertEqual(ctx.exception.stage, "token_claims")

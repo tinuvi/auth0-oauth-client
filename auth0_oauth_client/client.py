@@ -2,12 +2,14 @@ import hashlib
 import logging
 import time
 
+from collections.abc import Iterable
 from typing import Any
 from typing import cast
 from urllib.parse import parse_qs
 from urllib.parse import urlparse
 
 import jwt
+import requests
 
 from auth0.authentication import GetToken
 from auth0.management import Auth0
@@ -17,6 +19,7 @@ from django.db.models import Q
 from auth0_oauth_client.errors import AccessTokenErrorCode
 from auth0_oauth_client.errors import AccessTokenOauthClientError
 from auth0_oauth_client.errors import ApiOauthClientError
+from auth0_oauth_client.errors import Auth0PingError
 from auth0_oauth_client.errors import MissingRequiredArgumentOauthClientError
 from auth0_oauth_client.errors import MissingTransactionOauthClientError
 from auth0_oauth_client.oauth import build_authorization_url
@@ -65,6 +68,127 @@ class DjangoAuthClient:
         self.my_account_audience = f"https://{self.auth0_domain}/me/"
         self.connections_for_account_linking = read_required_key(base_configuration, "connections_for_account_linking")
         self.custom_scopes = base_configuration.get("custom_scopes", {})
+
+    def ping(
+        self,
+        *,
+        timeout: float = 5.0,
+        required_scopes: Iterable[str] = (),
+    ) -> dict:
+        """Readiness probe for the Auth0 Management API integration.
+
+        Always bypasses the M2M token cache and never writes to it, so
+        credential rotation and scope drift are detected on every probe
+        without disturbing production token TTLs.
+
+        Verifies in a single round-trip to /oauth/token:
+          1. client_id + client_secret can mint an M2M token for the
+             Management API audience.
+          2. The token's `iss` matches the configured tenant.
+          3. The token's `aud` includes the Management API audience.
+          4. The token's `scope` claim contains every entry in
+             `required_scopes`.
+
+        Auth0 silently drops unauthorized scopes from the token response
+        rather than erroring, so inspecting the issued JWT's `scope`
+        claim is the only way to verify the full grant.
+        """
+        audience = f"https://{self.auth0_management_api_domain}/api/v2/"
+        expected_iss = f"https://{self.auth0_management_api_domain}/"
+        token_url = f"https://{self.auth0_management_api_domain}/oauth/token"
+
+        started = time.monotonic()
+        try:
+            response = requests.post(
+                token_url,
+                json={
+                    "grant_type": "client_credentials",
+                    "client_id": self.client_id,
+                    "client_secret": self.client_secret,
+                    "audience": audience,
+                },
+                timeout=timeout,
+            )
+        except requests.Timeout as exc:
+            raise Auth0PingError(
+                stage="m2m_token",
+                message=f"Auth0 token endpoint timed out after {timeout}s",
+            ) from exc
+        except requests.RequestException as exc:
+            raise Auth0PingError(
+                stage="m2m_token",
+                message=f"Auth0 token endpoint unreachable: {exc}",
+            ) from exc
+
+        if not response.ok:
+            try:
+                body = response.json()
+                detail = body.get("error_description") or body.get("error") or response.text
+            except requests.JSONDecodeError:
+                detail = response.text
+            raise Auth0PingError(
+                stage="m2m_token",
+                message=f"Auth0 token endpoint returned HTTP {response.status_code}: {detail}",
+                status_code=response.status_code,
+            )
+
+        latency_ms = int((time.monotonic() - started) * 1000)
+
+        try:
+            token_response = response.json()
+        except requests.JSONDecodeError as exc:
+            raise Auth0PingError(
+                stage="m2m_token",
+                message=f"Auth0 token endpoint returned non-JSON body: {exc}",
+            ) from exc
+
+        access_token = token_response.get("access_token")
+        if not access_token:
+            raise Auth0PingError(
+                stage="m2m_token",
+                message="Auth0 token endpoint returned no access_token",
+            )
+
+        # Decode without signature verification. The token came directly from Auth0
+        # over TLS, consistent with how complete_login() decodes id_token.
+        try:
+            claims = jwt.decode(access_token, options={"verify_signature": False})
+        except jwt.InvalidTokenError as exc:
+            raise Auth0PingError(
+                stage="token_claims",
+                message=f"M2M access_token is not a decodable JWT: {exc}",
+            ) from exc
+
+        iss = claims.get("iss")
+        aud = claims.get("aud")
+        aud_list = aud if isinstance(aud, list) else [aud]
+        if iss != expected_iss:
+            raise Auth0PingError(
+                stage="token_claims",
+                message=f"iss mismatch: got {iss!r}, expected {expected_iss!r}",
+            )
+        if audience not in aud_list:
+            raise Auth0PingError(
+                stage="token_claims",
+                message=f"aud mismatch: got {aud_list!r}, expected to contain {audience!r}",
+            )
+
+        granted_scopes = (claims.get("scope") or "").split()
+        required = frozenset(required_scopes)
+        missing = required - set(granted_scopes)
+        if missing:
+            raise Auth0PingError(
+                stage="scope_grant",
+                message=f"M2M token is missing required scopes: {sorted(missing)}",
+                missing_scopes=missing,
+            )
+
+        return {
+            "ok": True,
+            "expires_in": token_response.get("expires_in"),
+            "granted_scopes": granted_scopes,
+            "latency_ms": latency_ms,
+        }
 
     def get_idp_username(self, request):
         session_data = self._get_session(request)

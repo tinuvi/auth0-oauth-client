@@ -1,3 +1,6 @@
+from typing import Literal
+
+
 class Auth0OauthClientError(Exception):
     pass
 
@@ -122,3 +125,23 @@ class CustomTokenExchangeErrorCode:
 class AccountLinkingError(Auth0OauthClientError):
     def __init__(self, message):
         super().__init__(message)
+
+
+PingStage = Literal["m2m_token", "token_claims", "scope_grant"]
+
+
+class Auth0PingError(ApiOauthClientError):
+    """Raised when DjangoAuthClient.ping() fails."""
+
+    def __init__(
+        self,
+        stage: PingStage,
+        message: str,
+        *,
+        status_code: int | None = None,
+        missing_scopes: frozenset[str] | None = None,
+    ):
+        self.stage = stage
+        self.status_code = status_code
+        self.missing_scopes = missing_scopes or frozenset()
+        super().__init__(stage, message)

@@ -384,3 +384,67 @@ Returns the `userinfo` payload from the current session, or `None` if no session
 | `request` | `HttpRequest` | The Django request.  |
 
 **Returns:** The `userinfo` dict from the session (decoded from the ID token at login), or `None`.
+
+---
+
+### Health checks / readiness probes
+
+#### `auth_client.ping(*, timeout: float = 5.0, required_scopes: Iterable[str] = ()) -> dict`
+
+Readiness probe for the Auth0 Management API integration. In a single round-trip to `/oauth/token`, verifies that:
+
+1. `client_id` + `client_secret` can mint an M2M token for the Management API audience.
+2. The issued token's `iss` and `aud` claims match the configured tenant.
+3. The token's `scope` claim contains every entry in `required_scopes`.
+
+**Always bypasses the M2M token cache and never writes to it**, so credential rotation and scope drift are detected on every probe without disturbing production token TTLs.
+
+Auth0 silently drops unauthorized scopes from the token response rather than erroring, so inspecting the issued JWT's `scope` claim is the only way to verify the full grant in a single call.
+
+| Parameter         | Type            | Description                                                                                                          |
+|-------------------|-----------------|----------------------------------------------------------------------------------------------------------------------|
+| `timeout`         | `float`         | HTTP timeout in seconds for the token request. Defaults to `5.0`.                                                    |
+| `required_scopes` | `Iterable[str]` | Scopes the caller's project needs granted on its M2M client_grant. Empty (default) skips the scope check.            |
+
+**Returns:** `{"ok": True, "expires_in": int, "granted_scopes": list[str], "latency_ms": int}`.
+
+**Raises:** `Auth0PingError` with one of three `stage` values:
+
+| `stage`        | Populates                  | Remediation                                                                                       |
+|----------------|----------------------------|---------------------------------------------------------------------------------------------------|
+| `m2m_token`    | `status_code` (when HTTP)  | Check `client_id`/`client_secret`; confirm M2M app is authorized for the Management API audience. |
+| `token_claims` | —                          | Check `auth0_management_api_domain` matches what Auth0 actually issues.                           |
+| `scope_grant`  | `missing_scopes` (frozenset) | Grant the listed missing scopes on the M2M `client_grant`.                                      |
+
+Example: a `django-health-check` backend that asserts the project's full M2M scope grant on every probe.
+
+```python
+import logging
+
+from auth0_oauth_client import auth_client, Auth0PingError
+from health_check.backends import BaseHealthCheckBackend
+from health_check.exceptions import ServiceUnavailable
+
+_logger = logging.getLogger("yourapp")
+
+# Source of truth for these scopes: the project's Terraform `auth0_client_grant`.
+_REQUIRED_M2M_SCOPES = frozenset({
+    "read:users",
+    "read:users_app_metadata",
+    "update:users",
+})
+
+
+class Auth0HealthCheck(BaseHealthCheckBackend):
+    critical_service = True
+
+    def check_status(self):
+        try:
+            auth_client.ping(timeout=5.0, required_scopes=_REQUIRED_M2M_SCOPES)
+        except Auth0PingError as exc:
+            _logger.exception("Auth0 healthcheck failed at stage %s", exc.stage)
+            detail = f"Auth0 {exc.stage} check failed"
+            if exc.missing_scopes:
+                detail += f" (missing: {sorted(exc.missing_scopes)})"
+            self.add_error(ServiceUnavailable(detail), exc)
+```
