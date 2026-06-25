@@ -25,6 +25,10 @@ class ConnectedAccountAdmin(admin.ModelAdmin):
         "email",
         "user_id_owner",
     )
+    readonly_fields = (
+        "created_at",
+        "updated_at",
+    )
 
 
 @admin.register(AccountToken)
@@ -37,6 +41,10 @@ class AccountTokenAdmin(admin.ModelAdmin):
         "updated_at",
     )
     search_fields = ("user_id",)
+    readonly_fields = (
+        "created_at",
+        "updated_at",
+    )
 
 
 @admin.register(AccountLinking)
@@ -53,4 +61,8 @@ class AccountLinkingAdmin(admin.ModelAdmin):
     search_fields = (
         "primary_user_id",
         "secondary_user_id",
+    )
+    readonly_fields = (
+        "created_at",
+        "updated_at",
     )
