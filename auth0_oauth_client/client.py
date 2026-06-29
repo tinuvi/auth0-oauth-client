@@ -6,12 +6,14 @@ from collections.abc import Iterable
 from typing import Any
 from typing import cast
 from urllib.parse import parse_qs
+from urllib.parse import quote
 from urllib.parse import urlparse
 
 import jwt
 import requests
 
 from auth0.authentication import GetToken
+from auth0.exceptions import Auth0Error
 from auth0.management import Auth0
 from django.core.cache import cache
 from django.db.models import Q
@@ -20,6 +22,7 @@ from auth0_oauth_client.errors import AccessTokenErrorCode
 from auth0_oauth_client.errors import AccessTokenOauthClientError
 from auth0_oauth_client.errors import ApiOauthClientError
 from auth0_oauth_client.errors import Auth0PingError
+from auth0_oauth_client.errors import FederatedConnectionRefreshTokenNotFound
 from auth0_oauth_client.errors import MissingRequiredArgumentOauthClientError
 from auth0_oauth_client.errors import MissingTransactionOauthClientError
 from auth0_oauth_client.oauth import build_authorization_url
@@ -681,8 +684,42 @@ class DjangoAuthClient:
             "subject_token": refresh_token,
             "subject_token_type": SUBJECT_TYPE_ACCESS_TOKEN,
         }
-        result = auth0_app.access_token_for_connection(**params)
+        try:
+            result = auth0_app.access_token_for_connection(**params)
+        except Auth0Error as exc:
+            # Auth0 returns HTTP 401 with error == "federated_connection_refresh_token_not_found"
+            # when the federated refresh token is gone from the Token Vault. Surface a precise,
+            # catchable type instead of forcing callers to string-match. Match the machine code only.
+            if exc.status_code == 401 and exc.error_code == FederatedConnectionRefreshTokenNotFound.code:
+                raise FederatedConnectionRefreshTokenNotFound(
+                    message=exc.message,
+                    error_description=exc.message,
+                    status_code=exc.status_code,
+                    cause=exc,
+                ) from exc
+            raise
         return result
+
+    def list_federated_connections_tokensets(self, user_id: str) -> list[dict]:
+        """GET /api/v2/users/{id}/federated-connections-tokensets via the Management API M2M token.
+
+        The Management API uses the application's own credentials, so it works even when the user's
+        federated refresh token is gone. Returns the raw tokenset list (each carries a `connection`).
+
+        Per the Auth0 Management API docs, a user with an EMPTY vault gets HTTP 200 with `[]` (returned
+        as-is by parsing the body). An HTTP 404 means the *user does not exist* — a genuine error, NOT an
+        empty vault — so it raises via `raise_for_status` (as does any 5xx/timeout). Callers therefore
+        treat a raised error as a transient skip and never mistake a missing user for an empty vault.
+        """
+        tokens = self._get_auth0_token_through_m2m()
+        url = f"https://{self.auth0_management_api_domain}/api/v2/users/{quote(user_id, safe='')}/federated-connections-tokensets"
+        response = requests.get(
+            url,
+            headers={"Authorization": f"Bearer {tokens['access_token']}"},
+            timeout=10,
+        )
+        response.raise_for_status()
+        return response.json()
 
     def get_refresh_token(self, request):
         session_data = self._get_session(request)

@@ -356,13 +356,32 @@ Exchanges a user's refresh token for a connection-specific access token using th
 
 **Returns:** Dict with `access_token`, `expires_in`, and `scope`.
 
+**Raises:** `FederatedConnectionRefreshTokenNotFound` when Auth0 responds HTTP 401 with `error == "federated_connection_refresh_token_not_found"` — i.e. the federated refresh token is gone from the Token Vault and the user must reconnect. Catch this precise type instead of string-matching; it exposes the stable machine code on `.error`/`.code` and preserves the original `Auth0Error` on `.cause`. Other `Auth0Error`s propagate unchanged.
+
 ```python
+from auth0_oauth_client.errors import FederatedConnectionRefreshTokenNotFound
+
 refresh_token = request.user.youruser.idp_refresh_token
-result = auth_client.get_access_token_for_connection_using_user_refresh_token(
-    refresh_token, "google-oauth2"
-)
+try:
+    result = auth_client.get_access_token_for_connection_using_user_refresh_token(
+        refresh_token, "google-oauth2"
+    )
+except FederatedConnectionRefreshTokenNotFound:
+    ...  # prompt the user to reconnect their Google account
 # Use result["access_token"] to call Google APIs
 ```
+
+---
+
+#### `auth_client.list_federated_connections_tokensets(user_id: str) -> list[dict]`
+
+Lists the federated-connection tokensets stored in the Token Vault for a user, via the Management API (`GET /api/v2/users/{id}/federated-connections-tokensets`). Uses the application's own M2M credentials, so it works even when the user's federated refresh token is missing — useful to proactively detect a vault that no longer holds a given connection.
+
+| Parameter | Type  | Description                                    |
+|-----------|-------|------------------------------------------------|
+| `user_id` | `str` | The Auth0 user ID (e.g. `"google-oauth2\|123"`). |
+
+**Returns:** The raw list of tokenset dicts; each carries a `connection` (e.g. `"google-oauth2"`).
 
 ---
 
