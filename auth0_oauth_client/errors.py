@@ -145,3 +145,26 @@ class Auth0PingError(ApiOauthClientError):
         self.status_code = status_code
         self.missing_scopes = missing_scopes or frozenset()
         super().__init__(stage, message)
+
+
+# Stable Auth0 machine code (HTTP 401) returned when the federated refresh token is gone from the
+# Token Vault. Always match this machine code, never the human-readable description.
+FEDERATED_CONNECTION_REFRESH_TOKEN_NOT_FOUND_CODE = "federated_connection_refresh_token_not_found"
+
+
+class FederatedConnectionRefreshTokenNotFound(Auth0OauthClientError):
+    """Raised when Auth0 returns HTTP 401 with error == 'federated_connection_refresh_token_not_found'.
+
+    The federated connection's refresh token (e.g. google-oauth2) is no longer in the Token Vault, so
+    the user must reconnect. Lets callers catch a precise type instead of string-matching. The stable
+    machine code is exposed on `.error`/`.code`; the original cause and status are preserved.
+    """
+
+    code = FEDERATED_CONNECTION_REFRESH_TOKEN_NOT_FOUND_CODE
+
+    def __init__(self, message=None, *, error_description=None, status_code=401, cause=None):
+        super().__init__(message or "Federated connection Refresh Token not found.")
+        self.error = self.code
+        self.error_description = error_description
+        self.status_code = status_code
+        self.cause = cause

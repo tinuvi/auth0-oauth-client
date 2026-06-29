@@ -7,6 +7,7 @@ from unittest.mock import patch
 import jwt
 import requests
 
+from auth0.exceptions import Auth0Error
 from django.core.cache import cache
 from django.test import RequestFactory
 from django.test import TestCase
@@ -17,6 +18,7 @@ from auth0_oauth_client.errors import AccessTokenErrorCode
 from auth0_oauth_client.errors import AccessTokenOauthClientError
 from auth0_oauth_client.errors import ApiOauthClientError
 from auth0_oauth_client.errors import Auth0PingError
+from auth0_oauth_client.errors import FederatedConnectionRefreshTokenNotFound
 from auth0_oauth_client.errors import MissingRequiredArgumentOauthClientError
 from auth0_oauth_client.errors import MissingTransactionOauthClientError
 from auth0_oauth_client.models import AccountLinking
@@ -1329,3 +1331,100 @@ class PingTest(TestCase):
         with self.assertRaises(Auth0PingError) as ctx:
             client.ping()
         self.assertEqual(ctx.exception.stage, "token_claims")
+
+
+class GetAccessTokenForConnectionUsingUserRefreshTokenTest(TestCase):
+    @patch("auth0_oauth_client.client.GetToken")
+    def test_returns_result_on_success(self, mock_get_token_cls):
+        mock_instance = MagicMock()
+        mock_instance.access_token_for_connection.return_value = {
+            "access_token": "fed_at",
+            "scope": "https://www.googleapis.com/auth/calendar",
+        }
+        mock_get_token_cls.return_value = mock_instance
+
+        client = DjangoAuthClient()
+        result = client.get_access_token_for_connection_using_user_refresh_token("rt_123", "google-oauth2")
+        self.assertEqual(result["access_token"], "fed_at")
+
+    @patch("auth0_oauth_client.client.GetToken")
+    def test_raises_typed_exception_on_federated_not_found_401(self, mock_get_token_cls):
+        mock_instance = MagicMock()
+        mock_instance.access_token_for_connection.side_effect = Auth0Error(
+            status_code=401,
+            error_code="federated_connection_refresh_token_not_found",
+            message="Federated connection Refresh Token not found.",
+        )
+        mock_get_token_cls.return_value = mock_instance
+
+        client = DjangoAuthClient()
+        with self.assertRaises(FederatedConnectionRefreshTokenNotFound) as ctx:
+            client.get_access_token_for_connection_using_user_refresh_token("rt_123", "google-oauth2")
+        self.assertEqual(ctx.exception.error, "federated_connection_refresh_token_not_found")
+        self.assertEqual(ctx.exception.code, "federated_connection_refresh_token_not_found")
+        self.assertEqual(ctx.exception.status_code, 401)
+        self.assertIsNotNone(ctx.exception.cause)
+
+    @patch("auth0_oauth_client.client.GetToken")
+    def test_reraises_other_auth0_errors(self, mock_get_token_cls):
+        mock_instance = MagicMock()
+        mock_instance.access_token_for_connection.side_effect = Auth0Error(
+            status_code=500,
+            error_code="server_error",
+            message="boom",
+        )
+        mock_get_token_cls.return_value = mock_instance
+
+        client = DjangoAuthClient()
+        with self.assertRaises(Auth0Error):
+            client.get_access_token_for_connection_using_user_refresh_token("rt_123", "google-oauth2")
+
+    @patch("auth0_oauth_client.client.GetToken")
+    def test_does_not_wrap_non_federated_401(self, mock_get_token_cls):
+        mock_instance = MagicMock()
+        mock_instance.access_token_for_connection.side_effect = Auth0Error(
+            status_code=401,
+            error_code="invalid_grant",
+            message="unrelated 401",
+        )
+        mock_get_token_cls.return_value = mock_instance
+
+        client = DjangoAuthClient()
+        with self.assertRaises(Auth0Error):
+            client.get_access_token_for_connection_using_user_refresh_token("rt_123", "google-oauth2")
+
+
+class ListFederatedConnectionsTokensetsTest(TestCase):
+    def setUp(self):
+        cache.clear()
+
+    @patch.object(DjangoAuthClient, "_get_auth0_token_through_m2m")
+    @patch("auth0_oauth_client.client.requests.get")
+    def test_returns_tokensets(self, mock_get, mock_m2m):
+        mock_m2m.return_value = {"access_token": "m2m_at"}
+        response = MagicMock()
+        response.json.return_value = [{"connection": "google-oauth2", "scopes": ["..."]}]
+        response.raise_for_status.return_value = None
+        mock_get.return_value = response
+
+        client = DjangoAuthClient()
+        result = client.list_federated_connections_tokensets("google-oauth2|123")
+
+        self.assertEqual(result[0]["connection"], "google-oauth2")
+        args, kwargs = mock_get.call_args
+        self.assertIn("/api/v2/users/", args[0])
+        # The user_id is URL-encoded into the path.
+        self.assertIn("google-oauth2%7C123", args[0])
+        self.assertEqual(kwargs["headers"]["Authorization"], "Bearer m2m_at")
+
+    @patch.object(DjangoAuthClient, "_get_auth0_token_through_m2m")
+    @patch("auth0_oauth_client.client.requests.get")
+    def test_raises_on_http_error(self, mock_get, mock_m2m):
+        mock_m2m.return_value = {"access_token": "m2m_at"}
+        response = MagicMock()
+        response.raise_for_status.side_effect = requests.HTTPError("500")
+        mock_get.return_value = response
+
+        client = DjangoAuthClient()
+        with self.assertRaises(requests.HTTPError):
+            client.list_federated_connections_tokensets("google-oauth2|123")
