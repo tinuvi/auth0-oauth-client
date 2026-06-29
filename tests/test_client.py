@@ -1422,7 +1422,41 @@ class ListFederatedConnectionsTokensetsTest(TestCase):
     def test_raises_on_http_error(self, mock_get, mock_m2m):
         mock_m2m.return_value = {"access_token": "m2m_at"}
         response = MagicMock()
+        response.status_code = 500
         response.raise_for_status.side_effect = requests.HTTPError("500")
+        mock_get.return_value = response
+
+        client = DjangoAuthClient()
+        with self.assertRaises(requests.HTTPError):
+            client.list_federated_connections_tokensets("google-oauth2|123")
+
+    @patch.object(DjangoAuthClient, "_get_auth0_token_through_m2m")
+    @patch("auth0_oauth_client.client.requests.get")
+    def test_returns_empty_list_on_200_empty_vault(self, mock_get, mock_m2m):
+        # Per the Auth0 docs, an EMPTY vault is HTTP 200 with `[]` (not a 404). It must be returned
+        # as-is so the caller recognises a confirmed-empty vault.
+        mock_m2m.return_value = {"access_token": "m2m_at"}
+        response = MagicMock()
+        response.status_code = 200
+        response.raise_for_status.return_value = None
+        response.json.return_value = []
+        mock_get.return_value = response
+
+        client = DjangoAuthClient()
+        result = client.list_federated_connections_tokensets("google-oauth2|123")
+
+        self.assertEqual(result, [])
+
+    @patch.object(DjangoAuthClient, "_get_auth0_token_through_m2m")
+    @patch("auth0_oauth_client.client.requests.get")
+    def test_raises_on_404_user_not_found(self, mock_get, mock_m2m):
+        # Per the Auth0 docs, a 404 means the *user does not exist* — a genuine error, NOT an empty
+        # vault. It must raise (not map to []) so the caller treats it as a transient skip rather than
+        # wrongly flipping the psychologist to NEEDS_RECONNECT.
+        mock_m2m.return_value = {"access_token": "m2m_at"}
+        response = MagicMock()
+        response.status_code = 404
+        response.raise_for_status.side_effect = requests.HTTPError("404")
         mock_get.return_value = response
 
         client = DjangoAuthClient()

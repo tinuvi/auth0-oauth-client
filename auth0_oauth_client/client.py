@@ -705,6 +705,11 @@ class DjangoAuthClient:
 
         The Management API uses the application's own credentials, so it works even when the user's
         federated refresh token is gone. Returns the raw tokenset list (each carries a `connection`).
+
+        Per the Auth0 Management API docs, a user with an EMPTY vault gets HTTP 200 with `[]` (returned
+        as-is by parsing the body). An HTTP 404 means the *user does not exist* — a genuine error, NOT an
+        empty vault — so it raises via `raise_for_status` (as does any 5xx/timeout). Callers therefore
+        treat a raised error as a transient skip and never mistake a missing user for an empty vault.
         """
         tokens = self._get_auth0_token_through_m2m()
         url = f"https://{self.auth0_management_api_domain}/api/v2/users/{quote(user_id, safe='')}/federated-connections-tokensets"
