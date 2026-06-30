@@ -361,6 +361,44 @@ class CompleteConnectAccountTest(TransactionTestCase):
         ca = ConnectedAccount.objects.get(connected_account_id="ca_123")
         self.assertTrue(ca.is_account_linked)
 
+    @patch("auth0_oauth_client.client.myaccount_complete_connect_account")
+    @patch.object(DjangoAuthClient, "_get_access_token", return_value="at_myaccount")
+    def test_reconnect_with_new_connected_account_id_updates_existing_row(self, mock_get_at, mock_complete):
+        # Regression: on RECONNECT of an already-linked account, Auth0 returns a NEW connected_account_id
+        # for the SAME (user_id_owner, provider). The upsert previously keyed on connected_account_id, so
+        # it missed the existing row, fell through to an INSERT, and violated the `unique_connected_account`
+        # (user_id_owner, provider) constraint -> IntegrityError (HTTP 500 in the /callback/ view). The
+        # upsert must instead key on (user_id_owner, provider) and update the existing row's id in place.
+        user_id = "auth0|owner1"
+        ConnectedAccount.objects.create(
+            connected_account_id="ca_OLD",
+            user_id_owner=user_id,
+            provider="google-oauth2",
+            email="owner1@example.com",
+            is_account_linked=False,
+        )
+        mock_complete.return_value = {"id": "ca_NEW", "connection": "google-oauth2"}
+
+        client = DjangoAuthClient()
+        request = _make_request_with_session()
+        request.session[DjangoAuthClient.SESSION_KEY_STATE] = _make_session_data(user_id=user_id)
+        request.session[DjangoAuthClient.SESSION_KEY_TX] = {
+            "state": "test-state",
+            "code_verifier": "verifier",
+            "redirect_uri": "https://app.test.com/callback",
+            "auth_session": "session_123",
+        }
+
+        callback_url = "https://app.test.com/callback?connect_code=cc_123&state=test-state"
+        # Must NOT raise IntegrityError.
+        client.complete_connect_account(request, callback_url)
+
+        # Exactly one row for (user, provider), updated in place to the new connected_account_id.
+        rows = ConnectedAccount.objects.filter(user_id_owner=user_id, provider="google-oauth2")
+        self.assertEqual(rows.count(), 1)
+        self.assertEqual(rows.first().connected_account_id, "ca_NEW")
+        self.assertFalse(ConnectedAccount.objects.filter(connected_account_id="ca_OLD").exists())
+
 
 class ListConnectedAccountsTest(TestCase):
     @patch("auth0_oauth_client.client.myaccount_list_connected_accounts")
