@@ -359,13 +359,21 @@ class DjangoAuthClient:
             Q(primary_user_id=user_id_owner) | Q(secondary_user_id=user_id_owner),
             secondary_provider=result["connection"],
         ).exists()
+        # Key the upsert on the (user_id_owner, provider) business identity — the `unique_connected_account`
+        # constraint — NOT on `connected_account_id`. On a RECONNECT of an already-linked account, Auth0
+        # issues a NEW connected_account_id; keying on it would miss the existing row, fall through to an
+        # INSERT, and violate `unique_connected_account` (user_id_owner, provider) with a 500. Keying on
+        # (user_id_owner, provider) instead UPDATES the existing row's connected_account_id in place.
         defaults = {
-            "user_id_owner": user_id_owner,
-            "provider": result["connection"],
+            "connected_account_id": result["id"],
             "email": session_data["userinfo"]["email"],
             "is_account_linked": is_linked,
         }
-        ConnectedAccount.objects.update_or_create(connected_account_id=result["id"], defaults=defaults)
+        ConnectedAccount.objects.update_or_create(
+            user_id_owner=user_id_owner,
+            provider=result["connection"],
+            defaults=defaults,
+        )
         return result
 
     def list_connected_accounts(self, request) -> list[ConnectedAccountResponse]:
