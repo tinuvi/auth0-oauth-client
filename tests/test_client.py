@@ -598,8 +598,8 @@ class VerifyAccountLinkingTest(TransactionTestCase):
             patch.object(
                 DjangoAuthClient, "_get_user_by_id_uncached", return_value=owner, side_effect=owner_error
             ) as mock_owner_read,
+            # The only way into `_link_user_accounts` (the Auth0 link call), so it is the link boundary here.
             patch.object(DjangoAuthClient, "_merge_and_link_accounts", return_value=[]) as mock_merge,
-            patch.object(DjangoAuthClient, "_link_user_accounts") as mock_link,
         ):
             result = client.verify_account_linking(request)
         return SimpleNamespace(
@@ -608,12 +608,10 @@ class VerifyAccountLinkingTest(TransactionTestCase):
             search=mock_search,
             owner_read=mock_owner_read,
             merge=mock_merge,
-            link=mock_link,
         )
 
     def _assert_not_linked(self, outcome, current_user_id):
         outcome.merge.assert_not_called()
-        outcome.link.assert_not_called()
         session_data = outcome.session[DjangoAuthClient.SESSION_KEY_STATE]
         self.assertEqual(session_data["userinfo"]["sub"], current_user_id)
         self.assertEqual(session_data["refresh_token"], "rt_123")
@@ -913,6 +911,8 @@ class VerifyAccountLinkingTest(TransactionTestCase):
         owners = {
             "email missing": _owner_record("facebook", email=_MISSING),
             "email null": _owner_record("facebook", email=None),
+            "email_verified false": _owner_record("facebook", email_verified=False),
+            "email_verified null": _owner_record("facebook", email_verified=None),
             "email_verified missing": _owner_record("facebook", email_verified=_MISSING),
             "email_verified as string": _owner_record("facebook", email_verified="true"),
             "identities empty": {"email": LINKING_EMAIL, "email_verified": True, "identities": []},
@@ -946,45 +946,58 @@ class VerifyAccountLinkingTest(TransactionTestCase):
     @patch.object(DjangoAuthClient, "_get_auth0_token_through_m2m", return_value={"access_token": "m2m_at"})
     @patch("auth0_oauth_client.client.Auth0")
     def test_connected_account_owner_read_bypasses_the_user_cache(self, mock_auth0_cls, mock_m2m):
-        owner_user_id = "auth0|owner"
-        owner_cache_key = f"_auth0_oauth_client_user_{owner_user_id}"
-        row = self._create_connected_account(owner_user_id)
-        # The cached owner claims a verified social account; the fresh Management API read says password.
-        stale_cached_owner = _owner_record("facebook")
+        # The cached owner claims a verified social account; the fresh Management API read disagrees.
         mock_users = mock_auth0_cls.return_value.users
-        mock_users.get.return_value = _owner_record("auth0")
-        password_candidate = _candidate_record(owner_user_id, "auth0")
+        fresh_reads = {
+            "password": ("auth0|owner", "auth0", True, "e-mail e senha"),
+            "unverified social": ("facebook|owner", "facebook", False, "Facebook"),
+        }
+        for fresh_label, (owner_user_id, fresh_provider, fresh_verified, friendly_name) in fresh_reads.items():
+            owner_cache_key = f"_auth0_oauth_client_user_{owner_user_id}"
+            row = self._create_connected_account(owner_user_id)
+            stale_cached_owner = _owner_record("facebook", email_verified=True)
+            mock_users.get.return_value = _owner_record(fresh_provider, email_verified=fresh_verified)
+            # The search returns the same owner, as it would, with the same fresh values.
+            candidate = _candidate_record(owner_user_id, fresh_provider, email_verified=fresh_verified)
 
-        for seed_owner_cache in (True, False):
-            with self.subTest(seed_owner_cache=seed_owner_cache):
-                cache.clear()
-                mock_users.get.reset_mock()
-                cache.set(f"_auth0_oauth_client_user_{self.GOOGLE_USER_ID}", _current_record())
-                if seed_owner_cache:
-                    cache.set(owner_cache_key, stale_cached_owner)
-                client, request = self._setup_client_and_request(user_id=self.GOOGLE_USER_ID)
+            for seed_owner_cache in (True, False):
+                with self.subTest(fresh_read=fresh_label, seed_owner_cache=seed_owner_cache):
+                    cache.clear()
+                    mock_users.reset_mock()
+                    cache.set(f"_auth0_oauth_client_user_{self.GOOGLE_USER_ID}", _current_record())
+                    if seed_owner_cache:
+                        cache.set(owner_cache_key, stale_cached_owner)
+                    client, request = self._setup_client_and_request(user_id=self.GOOGLE_USER_ID)
 
-                with (
-                    patch.object(
-                        DjangoAuthClient, "_search_users_excluding_connection", return_value=[password_candidate]
-                    ) as mock_search,
-                    patch.object(DjangoAuthClient, "_merge_and_link_accounts", return_value=[]) as mock_merge,
-                    patch.object(DjangoAuthClient, "_link_user_accounts") as mock_link,
-                ):
-                    result = client.verify_account_linking(request)
+                    with (
+                        patch.object(
+                            DjangoAuthClient, "_search_users_excluding_connection", return_value=[candidate]
+                        ) as mock_search,
+                        # A spy that runs the real method, so a wrong link would reach the faked Auth0 client.
+                        patch.object(
+                            DjangoAuthClient,
+                            "_merge_and_link_accounts",
+                            autospec=True,
+                            side_effect=DjangoAuthClient._merge_and_link_accounts,
+                        ) as mock_merge,
+                    ):
+                        result = client.verify_account_linking(request)
 
-                outcome = SimpleNamespace(
-                    result=result, session=request.session, search=mock_search, merge=mock_merge, link=mock_link
-                )
-                self._assert_manual_path(outcome, owner_user_id, "auth0", "e-mail e senha")
-                mock_auth0_cls.assert_called_with("test.auth0.com", "m2m_at")
-                mock_users.get.assert_called_once_with(id=owner_user_id)
-                if seed_owner_cache:
-                    self.assertEqual(cache.get(owner_cache_key), stale_cached_owner)
-                else:
-                    self.assertIsNone(cache.get(owner_cache_key))
-                row.refresh_from_db()
-                self.assertFalse(row.is_account_linked)
+                    outcome = SimpleNamespace(
+                        result=result, session=request.session, search=mock_search, merge=mock_merge
+                    )
+                    self._assert_manual_path(outcome, owner_user_id, fresh_provider, friendly_name)
+                    mock_users.link_user_account.assert_not_called()
+                    mock_users.update.assert_not_called()
+                    mock_auth0_cls.assert_called_with("test.auth0.com", "m2m_at")
+                    mock_users.get.assert_called_once_with(id=owner_user_id)
+                    if seed_owner_cache:
+                        self.assertEqual(cache.get(owner_cache_key), stale_cached_owner)
+                    else:
+                        self.assertIsNone(cache.get(owner_cache_key))
+                    row.refresh_from_db()
+                    self.assertFalse(row.is_account_linked)
+            row.delete()
 
     # endregion
 
@@ -1017,6 +1030,26 @@ class VerifyAccountLinkingTest(TransactionTestCase):
         outcome = self._verify(_current_record(), [candidate])
 
         self._assert_manual_path(outcome, self.PASSWORD_USER_ID, "auth0", "e-mail e senha")
+
+    def test_unverified_social_login_into_password_account_takes_manual_path(self):
+        for candidate_verified in (True, False):
+            with self.subTest(candidate_email_verified=candidate_verified):
+                candidate = _candidate_record(self.PASSWORD_USER_ID, "auth0", email_verified=candidate_verified)
+
+                with self.assertLogs("auth0_oauth_client", "DEBUG") as logs:
+                    outcome = self._verify(_current_record(email_verified=False), [candidate])
+
+                self._assert_manual_path(outcome, self.PASSWORD_USER_ID, "auth0", "e-mail e senha")
+                self._assert_logged(
+                    logs,
+                    [
+                        (
+                            "INFO",
+                            self.WITHHELD_MESSAGE,
+                            ("search", self.GOOGLE_USER_ID, self.PASSWORD_USER_ID, "auth0", False, candidate_verified),
+                        )
+                    ],
+                )
 
     def test_auto_links_two_verified_social_accounts(self):
         candidate = _candidate_record(self.FACEBOOK_USER_ID, "facebook")
