@@ -1957,6 +1957,38 @@ class SearchUsersExcludingConnectionTest(TestCase):
             ],
         )
 
+    @patch.object(DjangoAuthClient, "_get_auth0_token_through_m2m", return_value={"access_token": "m2m_at"})
+    @patch("auth0_oauth_client.client.Auth0")
+    def test_escapes_quotes_and_backslashes_inside_the_quoted_terms(self, mock_auth0_cls, mock_m2m):
+        mock_users = mock_auth0_cls.return_value.users
+        mock_users.list.return_value = {"users": []}
+        cases = {
+            "quote and backslash": (
+                'a"b\\c@example.com',
+                "google-oauth2",
+                r'email:"a\"b\\c@example.com" AND NOT identities.connection:"google-oauth2"',
+            ),
+            # Without escaping, the quote would close the term and `OR email:*` would match every user.
+            "term breakout attempt": (
+                'x@example.com" OR email:"*',
+                "google-oauth2",
+                r'email:"x@example.com\" OR email:\"*" AND NOT identities.connection:"google-oauth2"',
+            ),
+            "connection name": (
+                "user@example.com",
+                'odd"connection\\',
+                r'email:"user@example.com" AND NOT identities.connection:"odd\"connection\\"',
+            ),
+        }
+        client = DjangoAuthClient()
+        for label, (email, connection_name, expected_query) in cases.items():
+            with self.subTest(label):
+                mock_users.list.reset_mock()
+
+                client._search_users_excluding_connection(email, connection_name)
+
+                self.assertEqual(mock_users.list.call_args.kwargs["q"], expected_query)
+
 
 class UpdateUserTest(TestCase):
     @patch.object(DjangoAuthClient, "_get_auth0_token_through_m2m")

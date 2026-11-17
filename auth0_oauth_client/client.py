@@ -53,6 +53,18 @@ from auth0_oauth_client.typing import VerifyAccountLinkingResult
 _logger = logging.getLogger("auth0_oauth_client")
 
 
+def _escape_lucene_quoted_term(value: str) -> str:
+    """Escape a value placed inside a double-quoted term of an Auth0 user search query.
+
+    Auth0 user search v3 takes Lucene query syntax
+    (https://auth0.com/docs/manage-users/user-search/user-search-query-syntax). In the Lucene classic query
+    parser a quoted term is `"\\"" (<_QUOTED_CHAR>)* "\\""`, where `_QUOTED_CHAR` is any character except `"`
+    and `\\`, or a backslash followed by any character (`QueryParser.jj`). So only `\\` and `"` need escaping
+    there, the backslash first.
+    """
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
 class DjangoAuthClient:
     SESSION_KEY_TX = "_auth0_oauth_client_tx"
     SESSION_KEY_ACCOUNT_LINKING_TX = "_auth0_oauth_client_al_tx"
@@ -712,7 +724,11 @@ class DjangoAuthClient:
     def _search_users_excluding_connection(self, email: str, connection_name: str) -> list[SearchUserResponseBody]:
         _tokens = self._get_auth0_token_through_m2m()
         _auth0 = Auth0(self.auth0_management_api_domain, _tokens["access_token"])
-        q = f'email:"{email}" AND NOT identities.connection:"{connection_name}"'
+        # Escaped, so that a value with `"` or `\` cannot close the term and add clauses of its own.
+        q = (
+            f'email:"{_escape_lucene_quoted_term(email)}" '
+            f'AND NOT identities.connection:"{_escape_lucene_quoted_term(connection_name)}"'
+        )
         fields = ["user_id", "identities.provider", "identities.connection", "email", "email_verified", "created_at"]
         found_users = _auth0.users.list(q=q, fields=fields)["users"]
         # Sample output:
