@@ -543,10 +543,10 @@ def _current_record(provider="google-oauth2", email_verified=True, created_at=_M
     return _with_fields(record, email_verified=email_verified, created_at=created_at)
 
 
-def _candidate_record(user_id, provider, email_verified=True, created_at=_MISSING):
+def _candidate_record(user_id, provider, email_verified=True, created_at=_MISSING, email=LINKING_EMAIL):
     """A search result as `_search_users_excluding_connection` returns it."""
     record = {"user_id": user_id, "identities": [_identity(provider)]}
-    return _with_fields(record, email_verified=email_verified, created_at=created_at)
+    return _with_fields(record, email=email, email_verified=email_verified, created_at=created_at)
 
 
 def _owner_record(provider, email=LINKING_EMAIL, email_verified=True):
@@ -570,6 +570,9 @@ class VerifyAccountLinkingTest(TransactionTestCase):
     MULTIPLE_CANDIDATES_MESSAGE = "Multiple account linking candidates count=%s current_user_id=%s"
     OWNER_READ_FAILED_MESSAGE = (
         "Account linking owner read failed branch=connected_account candidate_user_id=%s status_code=%s"
+    )
+    CANDIDATE_IGNORED_MESSAGE = (
+        "Account linking candidate ignored, e-mail mismatch branch=search current_user_id=%s candidate_user_id=%s"
     )
     NOT_LINKED = {"is_pending_account_linking": False, "is_account_linked": False}
     PENDING = {"is_pending_account_linking": True, "is_account_linked": False}
@@ -1040,6 +1043,57 @@ class VerifyAccountLinkingTest(TransactionTestCase):
 
         self._assert_manual_path(outcome, "email|existing", "email", "email")
 
+    def test_search_candidate_with_another_email_is_ignored(self):
+        candidate_user_id = self.FACEBOOK_USER_ID
+        emails = {
+            "another e-mail": "someone.else@example.com",
+            "missing": _MISSING,
+            "null": None,
+            "not a string": ["victim.linking@example.com"],
+        }
+        for label, email in emails.items():
+            with self.subTest(candidate_email=label):
+                candidate = _candidate_record(candidate_user_id, "facebook", email=email)
+
+                with self.assertLogs("auth0_oauth_client", "DEBUG") as logs:
+                    outcome = self._verify(_current_record(), [candidate])
+
+                self.assertEqual(outcome.result, self.NOT_LINKED)
+                self.assertNotIn(DjangoAuthClient.SESSION_KEY_ACCOUNT_LINKING_TX, outcome.session)
+                self._assert_not_linked(outcome, self.GOOGLE_USER_ID)
+                self._assert_logged(
+                    logs, [("WARNING", self.CANDIDATE_IGNORED_MESSAGE, (self.GOOGLE_USER_ID, candidate_user_id))]
+                )
+                self.assertNotIn("someone.else", repr([record.args for record in logs.records]))
+
+    def test_search_candidate_email_matches_ignoring_case(self):
+        candidate = _candidate_record(self.PASSWORD_USER_ID, "auth0", email=LINKING_EMAIL.upper())
+
+        outcome = self._verify(_current_record(), [candidate])
+
+        self._assert_manual_path(outcome, self.PASSWORD_USER_ID, "auth0", "e-mail e senha")
+
+    def test_ignored_candidate_does_not_count_as_a_match(self):
+        # Only the matching candidate is considered, so it is the single candidate and the rules apply to it.
+        candidates = [
+            _candidate_record("facebook|other-email", "facebook", email="someone.else@example.com"),
+            _candidate_record(self.FACEBOOK_USER_ID, "facebook"),
+        ]
+        AccountToken.objects.create(user_id=self.FACEBOOK_USER_ID, refresh_token="rt_facebook")
+
+        with self.assertLogs("auth0_oauth_client", "DEBUG") as logs:
+            outcome = self._verify(_current_record(), candidates)
+
+        self.assertEqual(outcome.result, self.LINKED)
+        outcome.merge.assert_called_once_with(self.FACEBOOK_USER_ID, "google-oauth2", self.GOOGLE_USER_ID)
+        self._assert_logged(
+            logs,
+            [
+                ("WARNING", self.CANDIDATE_IGNORED_MESSAGE, (self.GOOGLE_USER_ID, "facebook|other-email")),
+                ("INFO", self.AUTO_LINK_MESSAGE, ("search", self.FACEBOOK_USER_ID, self.GOOGLE_USER_ID)),
+            ],
+        )
+
     def test_multiple_candidates_never_link_automatically(self):
         candidates = [
             _candidate_record("facebook|first", "facebook"),
@@ -1068,6 +1122,7 @@ class VerifyAccountLinkingTest(TransactionTestCase):
         mock_search.return_value = [
             {
                 "user_id": existing_user_id,
+                "email": "user@example.com",
                 "identities": [{"provider": "google-oauth2", "connection": "google-oauth2"}],
             }
         ]
@@ -1182,6 +1237,7 @@ class VerifyAccountLinkingTest(TransactionTestCase):
         candidate = {
             "user_id": candidate_user_id,
             "identities": [{"provider": "auth0", "connection": "Another-Database"}],
+            "email": LINKING_EMAIL,
             "email_verified": True,
             "created_at": "2026-02-01T00:00:00Z",
         }
@@ -1746,7 +1802,14 @@ class SearchUsersExcludingConnectionTest(TestCase):
         mock_auth0_cls.assert_called_once_with("test.auth0.com", "m2m_at")
         mock_auth0_instance.users.list.assert_called_once_with(
             q='email:"user@example.com" AND NOT identities.connection:"google-oauth2"',
-            fields=["user_id", "identities.provider", "identities.connection", "email_verified", "created_at"],
+            fields=[
+                "user_id",
+                "identities.provider",
+                "identities.connection",
+                "email",
+                "email_verified",
+                "created_at",
+            ],
         )
 
 

@@ -528,7 +528,20 @@ class DjangoAuthClient:
         account_link_verification_required = len(userinfo["identities"]) < number_of_available_connections
         if account_link_verification_required:
             current_account_connection_name = userinfo["identities"][0]["connection"]
-            candidates = self._search_users_excluding_connection(user_email, current_account_connection_name)
+            found_users = self._search_users_excluding_connection(user_email, current_account_connection_name)
+            # Every outcome below uses the candidate, so a result whose own e-mail does not match the current one
+            # is never trusted: it is ignored as if the search had not returned it.
+            candidates: list[SearchUserResponseBody] = []
+            for found_user in found_users:
+                if self._is_same_email(found_user.get("email"), user_email):
+                    candidates.append(found_user)
+                else:
+                    _logger.warning(
+                        "Account linking candidate ignored, e-mail mismatch branch=search current_user_id=%s "
+                        "candidate_user_id=%s",
+                        user_id,
+                        found_user.get("user_id"),
+                    )
             if candidates:
                 if len(candidates) > 1:
                     _logger.warning(
@@ -703,12 +716,13 @@ class DjangoAuthClient:
         _tokens = self._get_auth0_token_through_m2m()
         _auth0 = Auth0(self.auth0_management_api_domain, _tokens["access_token"])
         q = f'email:"{email}" AND NOT identities.connection:"{connection_name}"'
-        fields = ["user_id", "identities.provider", "identities.connection", "email_verified", "created_at"]
+        fields = ["user_id", "identities.provider", "identities.connection", "email", "email_verified", "created_at"]
         found_users = _auth0.users.list(q=q, fields=fields)["users"]
         # Sample output:
         # [
         #     {
         #         "created_at": "2026-02-03T12:00:00.000Z",
+        #         "email": "user@example.com",
         #         "email_verified": False,
         #         "identities": [{"connection": "Username-Password-Authentication", "provider": "auth0"}],
         #         "user_id": "auth0|69813210040e4b7128ed70f8",
