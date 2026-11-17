@@ -34,6 +34,18 @@ The [`sample_app`](./samples) demonstrates how to use the library. It implements
         - Logging in with `qwerty@gmail.com` does not match the connected account.
         - When the owner is an email/password account, or any of these conditions fails, the connected account is left untouched and the rules above decide.
 
+## Upgrading to 0.7.2
+
+0.7.2 is a security fix. It changes what `verify_account_linking` decides, not its signature, its result shape or the pending payload keys:
+
+- A social login is no longer linked automatically into an email/password account, verified or not. It returns `is_pending_account_linking: True`, and the user confirms by logging in with the email and password. Before, anyone who pre-registered a password account with someone else's email received that person's social login the first time it was used.
+- Automatic linking requires two social accounts with verified emails, in the search and in the connected-account branch.
+- Nothing is linked or proposed when the matching account is newer than the account being logged into, whatever the providers (see [Rules](#rules)).
+- The pending payload's `primary_provider_friendly_name` for `auth0` is now `e-mail e senha` (it was `email e senha`). A page that compares this value must accept both while sessions created before the upgrade still carry the old one; `primary_provider` (`auth0`) is the stable key to branch on.
+- A provider without a friendly name no longer raises `KeyError`: the pending payload shows its raw name.
+
+The commits are marked breaking (`!`) because callers observe different decisions. The release is still a patch so that every consumer pinned with `~=0.7.N`, which excludes 0.8, receives the security fix without changing its pin. The new outcomes are the pending path and "no linking", which every caller already handles. [SemVer](https://semver.org/#spec-item-4) also allows anything to change while the major version is zero.
+
 ## Why did we build this?
 
 Auth0 used to be the 'Stripe of Identity' sort of thing, known for its great developer experience. Lately, I’m not so sure. I almost gave up on it, but after finding some workarounds, I decided to build this library. I’m sharing it because seeing these issues go unaddressed hurts my software developer soul. 😬
