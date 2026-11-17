@@ -22,12 +22,15 @@ The [`sample_app`](./samples) demonstrates how to use the library. It implements
 - A login is never merged into another existing account without authenticating that account too, except between two social accounts whose emails are both verified. "Verified" means the Auth0 user's `email_verified` is exactly `true`; a missing, `null` or non-boolean value counts as not verified.
 - If a user signs up with an email/password, logs out, and later logs in using a social connection with that same email, the accounts are **not** linked automatically, even when the password account's email is verified. The user confirms once by logging in with the email and password (the pending linking flow), and the email/password account remains the primary account. Otherwise anyone who pre-registers a password account with someone else's email would receive that person's social login.
 - If a user signs up via social, logs out, and later tries to log in with a password using the same email, they'll need to re-authenticate with the original social provider to link the accounts. The primary account is the social one.
-    - Exception: when the social account was created **after** the password account (both `created_at` values are known), no linking is proposed and the user signs in to the password account. Such a social user exists only because an earlier social login was not linked (rule above), so confirming with it would move the password identity into an empty account. Equal or unknown dates keep the confirmation.
 - If a user signs up via social and later logs in with another social connection that has the same email, the accounts are linked automatically only when both emails are verified and exactly one other account matches. Otherwise the user confirms by re-authenticating with the existing account. When more than one account matches, a warning is logged and nothing is linked automatically.
+- Linking only ever merges the newer account into the older one, because the existing account always remains the primary account. When the other account was created **after** the account being logged into (both `created_at` values known), nothing is linked or proposed, whatever the providers, and the user signs in to the account she used. Equal or unknown dates follow the rules above.
+    - A password login that finds a newer social account: that social user exists only because an earlier social login was not linked (rule above), so confirming with it would move the password identity into an empty account.
+    - A social login that finds a newer password account: someone registered that password account later with the same email, possibly not the owner of the email, so confirming with it would move the social identity, and everything the app keyed on it, into that account.
+- A search result whose own email does not match the login's email (ignoring case) is ignored.
 - A connected account can lead to an automatic link. The library stores it with the email the user was **logged in with** when connecting, not the email of the connected provider account.
     - Consider the following scenario:
         - A user logs in with Facebook as `xpto@acme.com` and connects Google with `qwerty@gmail.com`. The connected account is stored with `xpto@acme.com`.
-        - Later, a different Auth0 user logs in with Google as `xpto@acme.com`. It is linked into the Facebook account, which remains the primary account, only if the owner, read fresh from the Management API, is still a social account whose email equals `xpto@acme.com` (case-insensitive), and both emails are verified.
+        - Later, a different Auth0 user logs in with Google as `xpto@acme.com`. It is linked into the Facebook account, which remains the primary account, only if that login's email is verified and the owner, read fresh from the Management API, is still a social account whose email equals `xpto@acme.com` (case-insensitive), is verified and is not newer than the logged-in account.
         - Logging in with `qwerty@gmail.com` does not match the connected account.
         - When the owner is an email/password account, or any of these conditions fails, the connected account is left untouched and the rules above decide.
 
@@ -318,18 +321,22 @@ These methods handle automatic and manual account linking when users sign in wit
 Checks whether the current login requires account linking, following the [Rules](#rules):
 
 - **Automatic link:** only when the current account and the matching account are both social accounts with verified
-  emails. The accounts are merged and linked in Auth0, and the session switches to the primary account.
-- **Pending linking:** every other match (including any social login into an email/password account) stores a pending
-  linking payload in the session and returns `is_pending_account_linking: True`, requiring the user to confirm by
-  re-authenticating with the existing account (`primary_provider` / `primary_provider_friendly_name`, e.g. `auth0` /
-  `e-mail e senha`).
-- **No linking:** no other account matches, the current account already has an identity for every connection in
-  `connections_for_account_linking`, or a password login matches a social account created after it.
+  emails, and the matching account is not newer. The accounts are merged and linked in Auth0, and the session switches
+  to the primary account.
+- **Pending linking:** every other match (including any social login into an older email/password account) stores a
+  pending linking payload in the session and returns `is_pending_account_linking: True`, requiring the user to confirm
+  by re-authenticating with the existing account (`primary_provider` / `primary_provider_friendly_name`, e.g. `auth0` /
+  `e-mail e senha`; a provider without a friendly name shows its raw name).
+- **No linking:** no other account with the same email matches; the current account already has at least as many
+  identities as there are connections in `connections_for_account_linking` (only the identity count is compared, not
+  which connections they belong to); or the matching account was created after the current one.
 
-A matching connected account is checked against a fresh Management API read of its owner, which bypasses the
-`get_user_by_id` cache. Unknown or malformed `email_verified` and `created_at` values never cause an automatic link nor
-an exception. Automatic links, withheld automatic links and skipped linkings are logged at `INFO` (several matching
-accounts at `WARNING`) on the `auth0_oauth_client` logger, with user IDs only.
+A matching connected account is checked only for a verified social login, against a fresh Management API read of its
+owner that bypasses the `get_user_by_id` cache. If that read fails with an Auth0 API error (for example the owner was
+deleted), the connected account is skipped and the search decides. Unknown or malformed `email_verified` and
+`created_at` values never cause an automatic link nor an exception. Automatic links, withheld automatic links and
+skipped linkings are logged at `INFO` (several matching accounts, ignored search results and a failed owner read at
+`WARNING`) on the `auth0_oauth_client` logger, with user IDs only.
 
 **Returns:** `{"is_pending_account_linking": bool, "is_account_linked": bool}`.
 

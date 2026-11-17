@@ -461,7 +461,8 @@ class DjangoAuthClient:
         A login is linked automatically only when the current account and the candidate are both social
         accounts whose e-mails are both verified (`email_verified` is exactly `True`). Every other match takes
         the manual path (a pending payload the user confirms by logging in with the candidate account), and
-        every unknown value fails closed into it.
+        every unknown value fails closed into it. A candidate created after the current account is never linked
+        with it, whatever the providers: linking only ever merges the newer account into the older one.
         """
         from auth0_oauth_client.models import ConnectedAccount
 
@@ -503,11 +504,13 @@ class DjangoAuthClient:
                         exc.status_code,
                     )
             owner_verified = self._is_verified(owner) if owner is not None else None
+            # As in the search branch, the owner stays primary, so it must not be newer than the current account.
             is_eligible_automatic_account_linking = (
                 owner is not None
                 and self._is_social_account(owner)
                 and self._is_same_email(owner.get("email"), user_email)
                 and owner_verified is True
+                and not self._is_created_after(owner, userinfo)
             )
             if is_eligible_automatic_account_linking:
                 return self._link_automatically(
@@ -549,6 +552,22 @@ class DjangoAuthClient:
                     )
                 candidate = candidates[0]
                 candidate_user_id = candidate["user_id"]
+                # Every link keeps the candidate as the primary account, so linking only ever merges the newer
+                # account into the older one. A candidate created after the current account exists because of a
+                # later signup with this e-mail (a social login that was not linked, or a password account
+                # registered afterwards, possibly by someone else). Merging the older account into it would move
+                # the identity, and everything the app keyed on it, into the newer account. So nothing is linked and
+                # the user signs in to the account she used. Equal or unknown dates keep the rules below.
+                if self._is_created_after(candidate, userinfo):
+                    _logger.info(
+                        "Account linking skipped, candidate is newer branch=search current_user_id=%s candidate_user_id=%s",
+                        user_id,
+                        candidate_user_id,
+                    )
+                    return {
+                        "is_pending_account_linking": False,
+                        "is_account_linked": False,
+                    }
                 if self._is_social_provider(current_account_provider):
                     candidate_verified = self._is_verified(candidate)
                     is_eligible_automatic_account_linking = (
@@ -569,28 +588,6 @@ class DjangoAuthClient:
                         current_verified,
                         candidate_verified,
                     )
-                    return self._store_pending_linking(request, candidate, userinfo, user_id, current_account_provider)
-                # A social user newer than the password user exists only because an earlier social login was not
-                # linked. Confirming with it would move this password identity into that empty account, so the
-                # user signs in to her own account instead. Equal or unknown dates keep the manual path.
-                current_created_at = self._parse_created_at(userinfo.get("created_at"))
-                candidate_created_at = self._parse_created_at(candidate.get("created_at"))
-                is_candidate_newer_social_account = (
-                    self._is_social_account(candidate)
-                    and current_created_at is not None
-                    and candidate_created_at is not None
-                    and candidate_created_at > current_created_at
-                )
-                if is_candidate_newer_social_account:
-                    _logger.info(
-                        "Account linking skipped, candidate is newer branch=search current_user_id=%s candidate_user_id=%s",
-                        user_id,
-                        candidate_user_id,
-                    )
-                    return {
-                        "is_pending_account_linking": False,
-                        "is_account_linked": False,
-                    }
                 return self._store_pending_linking(request, candidate, userinfo, user_id, current_account_provider)
         return {
             "is_pending_account_linking": False,
@@ -835,6 +832,16 @@ class DjangoAuthClient:
         if parsed.utcoffset() is None:
             return None
         return parsed
+
+    def _is_created_after(self, record: Mapping[str, object], reference: Mapping[str, object]) -> bool:
+        """`record` was created strictly after `reference`. `False` when either `created_at` is unknown."""
+        record_created_at = self._parse_created_at(record.get("created_at"))
+        reference_created_at = self._parse_created_at(reference.get("created_at"))
+        return (
+            record_created_at is not None
+            and reference_created_at is not None
+            and record_created_at > reference_created_at
+        )
 
     # endregion
 

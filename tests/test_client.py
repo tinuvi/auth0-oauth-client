@@ -549,10 +549,10 @@ def _candidate_record(user_id, provider, email_verified=True, created_at=_MISSIN
     return _with_fields(record, email=email, email_verified=email_verified, created_at=created_at)
 
 
-def _owner_record(provider, email=LINKING_EMAIL, email_verified=True):
+def _owner_record(provider, email=LINKING_EMAIL, email_verified=True, created_at=_MISSING):
     """A ConnectedAccount owner as the fresh Management API read returns it."""
     record = {"identities": [_identity(provider)]}
-    return _with_fields(record, email=email, email_verified=email_verified)
+    return _with_fields(record, email=email, email_verified=email_verified, created_at=created_at)
 
 
 class VerifyAccountLinkingTest(TransactionTestCase):
@@ -753,6 +753,32 @@ class VerifyAccountLinkingTest(TransactionTestCase):
         )
         self._assert_logged(
             logs, [("INFO", self.AUTO_LINK_MESSAGE, ("connected_account", owner_user_id, self.GOOGLE_USER_ID))]
+        )
+
+    def test_connected_account_newer_owner_is_never_linked(self):
+        # The owner stays primary, so a verified social owner created after the current account is not linked.
+        owner_user_id = "facebook|owner"
+        row = self._create_connected_account(owner_user_id)
+        current = _current_record(created_at="2026-01-01T00:00:00Z")
+        owner = _owner_record("facebook", created_at="2026-02-01T00:00:00Z")
+
+        with self.assertLogs("auth0_oauth_client", "DEBUG") as logs:
+            outcome = self._verify(current, owner=owner)
+
+        self.assertEqual(outcome.result, self.NOT_LINKED)
+        self._assert_not_linked(outcome, self.GOOGLE_USER_ID)
+        outcome.search.assert_called_once_with(LINKING_EMAIL, "google-oauth2")
+        row.refresh_from_db()
+        self.assertFalse(row.is_account_linked)
+        self._assert_logged(
+            logs,
+            [
+                (
+                    "INFO",
+                    self.WITHHELD_MESSAGE,
+                    ("connected_account", self.GOOGLE_USER_ID, owner_user_id, "facebook", True, True),
+                )
+            ],
         )
 
     def test_connected_account_owner_with_password_identity_is_never_linked(self):
@@ -1228,19 +1254,37 @@ class VerifyAccountLinkingTest(TransactionTestCase):
                     secondary_provider="auth0",
                 )
 
-    def test_password_login_with_newer_password_candidate_keeps_manual_path(self):
-        # Only a newer SOCIAL candidate skips linking. A password candidate can only come from another
-        # database connection, because the search excludes the current one.
-        current_user_id = "auth0|current"
-        candidate_user_id = "auth0|other-database"
-        current = _current_record("auth0", created_at="2026-01-01T00:00:00Z")
-        candidate = {
-            "user_id": candidate_user_id,
+    def _password_candidate_in_another_database(self, user_id, created_at):
+        # The search excludes the current connection, so a password candidate on a password login can only come
+        # from another database connection.
+        return {
+            "user_id": user_id,
             "identities": [{"provider": "auth0", "connection": "Another-Database"}],
             "email": LINKING_EMAIL,
             "email_verified": True,
-            "created_at": "2026-02-01T00:00:00Z",
+            "created_at": created_at,
         }
+
+    def test_password_login_with_newer_password_candidate_skips_linking(self):
+        # The newer-account rule holds whatever the candidate's provider is.
+        current_user_id = "auth0|current"
+        candidate_user_id = "auth0|other-database"
+        current = _current_record("auth0", created_at="2026-01-01T00:00:00Z")
+        candidate = self._password_candidate_in_another_database(candidate_user_id, "2026-02-01T00:00:00Z")
+
+        with self.assertLogs("auth0_oauth_client", "DEBUG") as logs:
+            outcome = self._verify(current, [candidate], user_id=current_user_id)
+
+        self.assertEqual(outcome.result, self.NOT_LINKED)
+        self.assertNotIn(DjangoAuthClient.SESSION_KEY_ACCOUNT_LINKING_TX, outcome.session)
+        self._assert_not_linked(outcome, current_user_id)
+        self._assert_logged(logs, [("INFO", self.SKIPPED_MESSAGE, (current_user_id, candidate_user_id))])
+
+    def test_password_login_with_older_password_candidate_takes_manual_path(self):
+        current_user_id = "auth0|current"
+        candidate_user_id = "auth0|other-database"
+        current = _current_record("auth0", created_at="2026-02-01T00:00:00Z")
+        candidate = self._password_candidate_in_another_database(candidate_user_id, "2026-01-01T00:00:00Z")
 
         outcome = self._verify(current, [candidate], user_id=current_user_id)
 
@@ -1250,6 +1294,58 @@ class VerifyAccountLinkingTest(TransactionTestCase):
         self.assertEqual(pending["primary_connection_name"], "Another-Database")
         self.assertEqual(pending["primary_provider_friendly_name"], "e-mail e senha")
         self._assert_not_linked(outcome, current_user_id)
+
+    def test_social_login_with_newer_password_candidate_skips_linking(self):
+        # An older Google account and a password account registered later with the same e-mail (possibly by
+        # someone else): confirming would move the Google identity, and her data, into the newer account.
+        current = _current_record(created_at="2026-01-01T00:00:00.000Z")
+        candidate = _candidate_record(self.PASSWORD_USER_ID, "auth0", created_at="2026-03-01T00:00:00.000Z")
+
+        with self.assertLogs("auth0_oauth_client", "DEBUG") as logs:
+            outcome = self._verify(current, [candidate])
+
+        self.assertEqual(outcome.result, self.NOT_LINKED)
+        self.assertNotIn(DjangoAuthClient.SESSION_KEY_ACCOUNT_LINKING_TX, outcome.session)
+        self._assert_not_linked(outcome, self.GOOGLE_USER_ID)
+        self._assert_logged(logs, [("INFO", self.SKIPPED_MESSAGE, (self.GOOGLE_USER_ID, self.PASSWORD_USER_ID))])
+
+    def test_social_login_with_newer_verified_social_candidate_skips_linking(self):
+        current = _current_record(created_at="2026-01-01T00:00:00.000Z")
+        candidate = _candidate_record(self.FACEBOOK_USER_ID, "facebook", created_at="2026-01-01T00:00:00.001Z")
+        AccountToken.objects.create(user_id=self.FACEBOOK_USER_ID, refresh_token="rt_facebook")
+
+        with self.assertLogs("auth0_oauth_client", "DEBUG") as logs:
+            outcome = self._verify(current, [candidate])
+
+        self.assertEqual(outcome.result, self.NOT_LINKED)
+        self.assertNotIn(DjangoAuthClient.SESSION_KEY_ACCOUNT_LINKING_TX, outcome.session)
+        self._assert_not_linked(outcome, self.GOOGLE_USER_ID)
+        self._assert_logged(logs, [("INFO", self.SKIPPED_MESSAGE, (self.GOOGLE_USER_ID, self.FACEBOOK_USER_ID))])
+
+    def test_social_login_with_older_password_candidate_takes_manual_path(self):
+        current = _current_record(created_at="2026-11-17T09:30:00.000Z")
+        candidate = _candidate_record(self.PASSWORD_USER_ID, "auth0", created_at="2026-06-01T12:00:00.000Z")
+
+        outcome = self._verify(current, [candidate])
+
+        self._assert_manual_path(outcome, self.PASSWORD_USER_ID, "auth0", "e-mail e senha")
+
+    def test_social_login_with_older_or_same_age_verified_social_candidate_links_automatically(self):
+        cases = {
+            "older": ("2026-11-17T09:30:00.000Z", "2026-06-01T12:00:00.000Z"),
+            "same instant": ("2026-01-01T00:00:00Z", "2025-12-31T21:00:00-03:00"),
+        }
+        AccountToken.objects.create(user_id=self.FACEBOOK_USER_ID, refresh_token="rt_facebook")
+        for label, (current_created_at, candidate_created_at) in cases.items():
+            with self.subTest(label):
+                AccountLinking.objects.all().delete()
+                current = _current_record(created_at=current_created_at)
+                candidate = _candidate_record(self.FACEBOOK_USER_ID, "facebook", created_at=candidate_created_at)
+
+                outcome = self._verify(current, [candidate])
+
+                self.assertEqual(outcome.result, self.LINKED)
+                outcome.merge.assert_called_once_with(self.FACEBOOK_USER_ID, "google-oauth2", self.GOOGLE_USER_ID)
 
     def test_multiple_candidates_on_password_login_apply_the_newer_rule_to_the_first(self):
         current_user_id = "auth0|current"
@@ -1358,6 +1454,22 @@ class AccountLinkingHelpersTest(TestCase):
         for value in ("2026-01-01T00:00:00", "yesterday", "", 1767225600, None):
             with self.subTest(value=value):
                 self.assertIsNone(client._parse_created_at(value))
+
+    def test_is_created_after_only_when_strictly_later_and_both_known(self):
+        client = DjangoAuthClient()
+        cases = {
+            "later": ("2026-01-01T00:00:00.001Z", "2026-01-01T00:00:00Z", True),
+            "earlier": ("2025-12-31T23:59:59Z", "2026-01-01T00:00:00Z", False),
+            "same instant in another offset": ("2025-12-31T21:00:00-03:00", "2026-01-01T00:00:00Z", False),
+            "record unknown": (None, "2026-01-01T00:00:00Z", False),
+            "reference unknown": ("2026-01-01T00:00:00Z", "yesterday", False),
+        }
+        for label, (record_created_at, reference_created_at, expected) in cases.items():
+            with self.subTest(label):
+                self.assertIs(
+                    client._is_created_after({"created_at": record_created_at}, {"created_at": reference_created_at}),
+                    expected,
+                )
 
 
 class PendingAccountLinkingTest(TestCase):
