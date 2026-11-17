@@ -849,7 +849,7 @@ class DjangoAuthClient:
 
     def get_access_token_for_connection(self, request, connection: str) -> GoogleTokenResult:
         refresh_token = self.get_refresh_token(request)
-        return self.get_access_token_for_connection(refresh_token, connection)
+        return self.get_access_token_for_connection_using_user_refresh_token(refresh_token, connection)
 
     def get_access_token_for_connection_using_user_refresh_token(
         self, refresh_token, connection: str

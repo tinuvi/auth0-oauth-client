@@ -2263,6 +2263,25 @@ class PingTest(TestCase):
         self.assertEqual(ctx.exception.stage, "token_claims")
 
 
+class GetAccessTokenForConnectionTest(TestCase):
+    @patch("auth0_oauth_client.client.GetToken")
+    def test_exchanges_the_session_refresh_token(self, mock_get_token_cls):
+        # Regression: the method called itself with the refresh token in place of the request.
+        mock_exchange = mock_get_token_cls.return_value.access_token_for_connection
+        mock_exchange.return_value = {"access_token": "fed_at", "expires_in": 3600, "scope": "calendar"}
+        client = DjangoAuthClient()
+        request = _make_request_with_session()
+        request.session[DjangoAuthClient.SESSION_KEY_STATE] = _make_session_data(refresh_token="rt_session")
+
+        result = client.get_access_token_for_connection(request, "google-oauth2")
+
+        self.assertEqual(result["access_token"], "fed_at")
+        mock_get_token_cls.assert_called_once_with("test.auth0.com", "test-client-id", "test-client-secret")
+        mock_exchange.assert_called_once()
+        self.assertEqual(mock_exchange.call_args.kwargs["subject_token"], "rt_session")
+        self.assertEqual(mock_exchange.call_args.kwargs["connection"], "google-oauth2")
+
+
 class GetAccessTokenForConnectionUsingUserRefreshTokenTest(TestCase):
     @patch("auth0_oauth_client.client.GetToken")
     def test_returns_result_on_success(self, mock_get_token_cls):
