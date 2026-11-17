@@ -1,6 +1,9 @@
 import hashlib
 import time
 
+from datetime import UTC
+from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
@@ -8,6 +11,7 @@ import jwt
 import requests
 
 from auth0.exceptions import Auth0Error
+from auth0.exceptions import RateLimitError
 from django.core.cache import cache
 from django.test import RequestFactory
 from django.test import TestCase
@@ -515,20 +519,161 @@ class CompleteAccountLinkingTest(TransactionTestCase):
         self.assertTrue(ca.is_account_linked)
 
 
+LINKING_EMAIL = "victim.linking@example.com"
+PASSWORD_CONNECTION = "Username-Password-Authentication"
+# Marks a field that the Auth0 record must not carry at all (as opposed to carrying `None`).
+_MISSING = object()
+
+
+def _identity(provider):
+    connection = PASSWORD_CONNECTION if provider == "auth0" else provider
+    return {"provider": provider, "connection": connection}
+
+
+def _with_fields(record, **fields):
+    for key, value in fields.items():
+        if value is not _MISSING:
+            record[key] = value
+    return record
+
+
+def _current_record(provider="google-oauth2", email_verified=True, created_at=_MISSING):
+    """The current account as `get_user_by_id` returns it."""
+    record = {"email": LINKING_EMAIL, "identities": [_identity(provider)]}
+    return _with_fields(record, email_verified=email_verified, created_at=created_at)
+
+
+def _candidate_record(user_id, provider, email_verified=True, created_at=_MISSING, email=LINKING_EMAIL):
+    """A search result as `_search_users_excluding_connection` returns it."""
+    record = {"user_id": user_id, "identities": [_identity(provider)]}
+    return _with_fields(record, email=email, email_verified=email_verified, created_at=created_at)
+
+
+def _owner_record(provider, email=LINKING_EMAIL, email_verified=True, created_at=_MISSING):
+    """A ConnectedAccount owner as the fresh Management API read returns it."""
+    record = {"identities": [_identity(provider)]}
+    return _with_fields(record, email=email, email_verified=email_verified, created_at=created_at)
+
+
 class VerifyAccountLinkingTest(TransactionTestCase):
+    GOOGLE_USER_ID = "google-oauth2|newuser"
+    PASSWORD_USER_ID = "auth0|existing"
+    FACEBOOK_USER_ID = "facebook|existing"
+    AUTO_LINK_MESSAGE = "Account linked automatically branch=%s primary_user_id=%s secondary_user_id=%s"
+    WITHHELD_MESSAGE = (
+        "Automatic account linking withheld branch=%s current_user_id=%s candidate_user_id=%s "
+        "candidate_provider=%s current_email_verified=%s candidate_email_verified=%s"
+    )
+    SKIPPED_MESSAGE = (
+        "Account linking skipped, candidate is newer branch=search current_user_id=%s candidate_user_id=%s"
+    )
+    MULTIPLE_CANDIDATES_MESSAGE = "Multiple account linking candidates count=%s current_user_id=%s"
+    OWNER_READ_FAILED_MESSAGE = (
+        "Account linking owner read failed branch=connected_account candidate_user_id=%s status_code=%s"
+    )
+    CANDIDATE_IGNORED_MESSAGE = (
+        "Account linking candidate ignored, e-mail mismatch branch=search current_user_id=%s candidate_user_id=%s"
+    )
+    NOT_LINKED = {"is_pending_account_linking": False, "is_account_linked": False}
+    PENDING = {"is_pending_account_linking": True, "is_account_linked": False}
+    LINKED = {"is_pending_account_linking": False, "is_account_linked": True}
+
+    def setUp(self):
+        cache.clear()
+
     def _setup_client_and_request(self, user_id="auth0|user1"):
         client = DjangoAuthClient()
         request = _make_request_with_session()
-        request.session[DjangoAuthClient.SESSION_KEY_STATE] = _make_session_data(user_id=user_id)
+        request.session[DjangoAuthClient.SESSION_KEY_STATE] = _make_session_data(user_id=user_id, email=LINKING_EMAIL)
         return client, request
 
+    def _verify(self, current, candidates=(), user_id=GOOGLE_USER_ID, owner=None, owner_error=None):
+        """Run `verify_account_linking` with every Auth0 boundary replaced, and return what it touched."""
+        client, request = self._setup_client_and_request(user_id=user_id)
+        with (
+            patch.object(DjangoAuthClient, "get_user_by_id", return_value=current),
+            patch.object(
+                DjangoAuthClient, "_search_users_excluding_connection", return_value=list(candidates)
+            ) as mock_search,
+            patch.object(
+                DjangoAuthClient, "_get_user_by_id_uncached", return_value=owner, side_effect=owner_error
+            ) as mock_owner_read,
+            # The only way into `_link_user_accounts` (the Auth0 link call), so it is the link boundary here.
+            patch.object(DjangoAuthClient, "_merge_and_link_accounts", return_value=[]) as mock_merge,
+        ):
+            result = client.verify_account_linking(request)
+        return SimpleNamespace(
+            result=result,
+            session=request.session,
+            search=mock_search,
+            owner_read=mock_owner_read,
+            merge=mock_merge,
+        )
+
+    def _assert_not_linked(self, outcome, current_user_id):
+        outcome.merge.assert_not_called()
+        session_data = outcome.session[DjangoAuthClient.SESSION_KEY_STATE]
+        self.assertEqual(session_data["userinfo"]["sub"], current_user_id)
+        self.assertEqual(session_data["refresh_token"], "rt_123")
+        self.assertFalse(AccountLinking.objects.exists())
+
+    def _assert_manual_path(
+        self,
+        outcome,
+        primary_user_id,
+        primary_provider,
+        friendly_name,
+        secondary_user_id=GOOGLE_USER_ID,
+        secondary_provider="google-oauth2",
+    ):
+        self.assertEqual(outcome.result, self.PENDING)
+        self.assertEqual(
+            outcome.session[DjangoAuthClient.SESSION_KEY_ACCOUNT_LINKING_TX],
+            {
+                "primary_user_id": primary_user_id,
+                "primary_provider": primary_provider,
+                "primary_provider_friendly_name": friendly_name,
+                "primary_connection_name": _identity(primary_provider)["connection"],
+                "secondary_user_id": secondary_user_id,
+                "secondary_provider": secondary_provider,
+                "secondary_connection_name": _identity(secondary_provider)["connection"],
+            },
+        )
+        self._assert_not_linked(outcome, secondary_user_id)
+
+    def _assert_logged(self, logs, expected):
+        self.assertEqual([(record.levelname, record.msg, record.args) for record in logs.records], expected)
+        for record in logs.records:
+            self.assertNotIn(LINKING_EMAIL.casefold(), record.getMessage().casefold())
+            self.assertNotIn(LINKING_EMAIL.casefold(), repr(record.args).casefold())
+            # The raw Auth0 link response (identities with profileData) must never reach a log line.
+            self.assertNotIn("Merged and linked accounts", record.getMessage())
+
+    def _create_connected_account(self, owner_user_id, provider="google-oauth2"):
+        return ConnectedAccount.objects.create(
+            connected_account_id=f"ca_{owner_user_id}",
+            email=LINKING_EMAIL,
+            provider=provider,
+            user_id_owner=owner_user_id,
+            is_account_linked=False,
+        )
+
+    # region ConnectedAccount branch
+
+    @patch.object(DjangoAuthClient, "_get_user_by_id_uncached")
     @patch.object(DjangoAuthClient, "get_user_by_id")
-    def test_linked_via_connected_account_entry(self, mock_get_user_by_id):
-        user_id = "auth0|user1"
-        primary_user_id = "auth0|primary"
+    def test_linked_via_connected_account_entry(self, mock_get_user_by_id, mock_get_owner):
+        user_id = "google-oauth2|user1"
+        primary_user_id = "facebook|primary"
         mock_get_user_by_id.return_value = {
             "email": "user@example.com",
+            "email_verified": True,
             "identities": [{"provider": "google-oauth2", "connection": "google-oauth2"}],
+        }
+        mock_get_owner.return_value = {
+            "email": "user@example.com",
+            "email_verified": True,
+            "identities": [{"provider": "facebook", "connection": "facebook"}],
         }
 
         ConnectedAccount.objects.create(
@@ -551,6 +696,7 @@ class VerifyAccountLinkingTest(TransactionTestCase):
         self.assertTrue(ca.is_account_linked)
         session_data = request.session[DjangoAuthClient.SESSION_KEY_STATE]
         self.assertEqual(session_data["userinfo"]["sub"], primary_user_id)
+        mock_get_owner.assert_called_once_with(primary_user_id)
 
     @patch.object(DjangoAuthClient, "_search_users_excluding_connection")
     @patch.object(DjangoAuthClient, "get_user_by_id")
@@ -578,30 +724,471 @@ class VerifyAccountLinkingTest(TransactionTestCase):
         ca = ConnectedAccount.objects.get(connected_account_id="ca_self")
         self.assertFalse(ca.is_account_linked)
 
-    @patch.object(DjangoAuthClient, "_search_users_excluding_connection")
-    @patch.object(DjangoAuthClient, "get_user_by_id")
-    def test_auto_links_social_provider(self, mock_get_user_by_id, mock_search):
-        user_id = "google-oauth2|newuser"
-        existing_user_id = "auth0|existing"
-        mock_get_user_by_id.return_value = {
-            "email": "user@example.com",
-            "identities": [{"provider": "google-oauth2", "connection": "google-oauth2"}],
+    def test_connected_account_links_verified_social_owner_with_email_in_other_case(self):
+        owner_user_id = "facebook|owner"
+        row = self._create_connected_account(owner_user_id)
+        AccountToken.objects.create(user_id=owner_user_id, refresh_token="rt_owner")
+        owner = _owner_record("facebook", email=LINKING_EMAIL.upper())
+
+        with self.assertLogs("auth0_oauth_client", "DEBUG") as logs:
+            outcome = self._verify(_current_record(), owner=owner)
+
+        self.assertEqual(outcome.result, self.LINKED)
+        outcome.owner_read.assert_called_once_with(owner_user_id)
+        outcome.merge.assert_called_once_with(owner_user_id, "google-oauth2", self.GOOGLE_USER_ID)
+        outcome.search.assert_not_called()
+        row.refresh_from_db()
+        self.assertTrue(row.is_account_linked)
+        session_data = outcome.session[DjangoAuthClient.SESSION_KEY_STATE]
+        self.assertEqual(session_data["userinfo"]["sub"], owner_user_id)
+        self.assertEqual(session_data["refresh_token"], "rt_owner")
+        self.assertTrue(
+            AccountLinking.objects.filter(
+                primary_user_id=owner_user_id,
+                secondary_provider="google-oauth2",
+                secondary_user_id=self.GOOGLE_USER_ID,
+            ).exists()
+        )
+        self._assert_logged(
+            logs, [("INFO", self.AUTO_LINK_MESSAGE, ("connected_account", owner_user_id, self.GOOGLE_USER_ID))]
+        )
+
+    def test_connected_account_links_older_verified_social_owner(self):
+        owner_user_id = "facebook|owner"
+        row = self._create_connected_account(owner_user_id)
+        AccountToken.objects.create(user_id=owner_user_id, refresh_token="rt_owner")
+        current = _current_record(created_at="2026-11-17T09:30:00.000Z")
+        owner = _owner_record("facebook", created_at="2026-06-01T12:00:00.000Z")
+
+        with self.assertLogs("auth0_oauth_client", "DEBUG") as logs:
+            outcome = self._verify(current, owner=owner)
+
+        self.assertEqual(outcome.result, self.LINKED)
+        outcome.owner_read.assert_called_once_with(owner_user_id)
+        outcome.merge.assert_called_once_with(owner_user_id, "google-oauth2", self.GOOGLE_USER_ID)
+        outcome.search.assert_not_called()
+        row.refresh_from_db()
+        self.assertTrue(row.is_account_linked)
+        self.assertEqual(outcome.session[DjangoAuthClient.SESSION_KEY_STATE]["userinfo"]["sub"], owner_user_id)
+        self._assert_logged(
+            logs, [("INFO", self.AUTO_LINK_MESSAGE, ("connected_account", owner_user_id, self.GOOGLE_USER_ID))]
+        )
+
+    def test_connected_account_newer_owner_is_never_linked(self):
+        # The owner stays primary, so a verified social owner created after the current account is not linked.
+        owner_user_id = "facebook|owner"
+        row = self._create_connected_account(owner_user_id)
+        current = _current_record(created_at="2026-01-01T00:00:00Z")
+        owner = _owner_record("facebook", created_at="2026-02-01T00:00:00Z")
+
+        with self.assertLogs("auth0_oauth_client", "DEBUG") as logs:
+            outcome = self._verify(current, owner=owner)
+
+        self.assertEqual(outcome.result, self.NOT_LINKED)
+        self._assert_not_linked(outcome, self.GOOGLE_USER_ID)
+        outcome.search.assert_called_once_with(LINKING_EMAIL, "google-oauth2")
+        row.refresh_from_db()
+        self.assertFalse(row.is_account_linked)
+        self._assert_logged(
+            logs,
+            [
+                (
+                    "INFO",
+                    self.WITHHELD_MESSAGE,
+                    ("connected_account", self.GOOGLE_USER_ID, owner_user_id, "facebook", True, True),
+                )
+            ],
+        )
+
+    def test_connected_account_owner_with_password_identity_is_never_linked(self):
+        owner_user_id = "auth0|owner"
+        row = self._create_connected_account(owner_user_id)
+        for owner_verified in (True, False):
+            with self.subTest(owner_email_verified=owner_verified):
+                owner = _owner_record("auth0", email_verified=owner_verified)
+                password_candidate = _candidate_record(owner_user_id, "auth0", email_verified=owner_verified)
+
+                with self.assertLogs("auth0_oauth_client", "DEBUG") as logs:
+                    outcome = self._verify(_current_record(), [password_candidate], owner=owner)
+
+                self._assert_manual_path(outcome, owner_user_id, "auth0", "e-mail e senha")
+                outcome.owner_read.assert_called_once_with(owner_user_id)
+                outcome.search.assert_called_once_with(LINKING_EMAIL, "google-oauth2")
+                row.refresh_from_db()
+                self.assertFalse(row.is_account_linked)
+                self._assert_logged(
+                    logs,
+                    [
+                        (
+                            "INFO",
+                            self.WITHHELD_MESSAGE,
+                            ("connected_account", self.GOOGLE_USER_ID, owner_user_id, "auth0", True, owner_verified),
+                        ),
+                        (
+                            "INFO",
+                            self.WITHHELD_MESSAGE,
+                            ("search", self.GOOGLE_USER_ID, owner_user_id, "auth0", True, owner_verified),
+                        ),
+                    ],
+                )
+
+    def test_connected_account_social_owner_with_another_email_falls_through_to_search(self):
+        owner_user_id = "facebook|owner"
+        row = self._create_connected_account(owner_user_id)
+        owner = _owner_record("facebook", email="someone.else@example.com")
+
+        outcome = self._verify(_current_record(), owner=owner)
+
+        self.assertEqual(outcome.result, self.NOT_LINKED)
+        self._assert_not_linked(outcome, self.GOOGLE_USER_ID)
+        outcome.search.assert_called_once_with(LINKING_EMAIL, "google-oauth2")
+        row.refresh_from_db()
+        self.assertFalse(row.is_account_linked)
+
+    def test_connected_account_with_unverified_current_account_falls_through_to_search(self):
+        owner_user_id = "facebook|owner"
+        row = self._create_connected_account(owner_user_id)
+
+        with self.assertLogs("auth0_oauth_client", "DEBUG") as logs:
+            outcome = self._verify(_current_record(email_verified=False), owner=_owner_record("facebook"))
+
+        self.assertEqual(outcome.result, self.NOT_LINKED)
+        self._assert_not_linked(outcome, self.GOOGLE_USER_ID)
+        # An unverified login can never be linked automatically, so the owner is not even read.
+        outcome.owner_read.assert_not_called()
+        outcome.search.assert_called_once_with(LINKING_EMAIL, "google-oauth2")
+        row.refresh_from_db()
+        self.assertFalse(row.is_account_linked)
+        self._assert_logged(
+            logs,
+            [
+                (
+                    "INFO",
+                    self.WITHHELD_MESSAGE,
+                    ("connected_account", self.GOOGLE_USER_ID, owner_user_id, None, False, None),
+                )
+            ],
+        )
+
+    def test_connected_account_owner_read_failure_falls_through_to_search(self):
+        owner_user_id = "facebook|owner"
+        row = self._create_connected_account(owner_user_id)
+        errors = {
+            "rate limited": RateLimitError(error_code="too_many_requests", message="Too Many Requests", reset_at=0),
+            "server error": Auth0Error(status_code=503, error_code="temporarily_unavailable", message="Unavailable"),
         }
-        mock_search.return_value = [
-            {
-                "user_id": existing_user_id,
-                "identities": [{"provider": "auth0", "connection": "Username-Password-Authentication"}],
-            }
-        ]
-        AccountToken.objects.create(user_id=existing_user_id, refresh_token="rt_existing")
+        for label, error in errors.items():
+            with self.subTest(label):
+                with self.assertLogs("auth0_oauth_client", "DEBUG") as logs:
+                    outcome = self._verify(_current_record(), owner_error=error)
 
-        client, request = self._setup_client_and_request(user_id=user_id)
+                self.assertEqual(outcome.result, self.NOT_LINKED)
+                self._assert_not_linked(outcome, self.GOOGLE_USER_ID)
+                outcome.owner_read.assert_called_once_with(owner_user_id)
+                outcome.search.assert_called_once_with(LINKING_EMAIL, "google-oauth2")
+                row.refresh_from_db()
+                self.assertFalse(row.is_account_linked)
+                self._assert_logged(
+                    logs,
+                    [
+                        ("WARNING", self.OWNER_READ_FAILED_MESSAGE, (owner_user_id, error.status_code)),
+                        (
+                            "INFO",
+                            self.WITHHELD_MESSAGE,
+                            ("connected_account", self.GOOGLE_USER_ID, owner_user_id, None, True, None),
+                        ),
+                    ],
+                )
 
-        with patch.object(client, "_merge_and_link_accounts", return_value=[]):
+    @patch.object(DjangoAuthClient, "_get_auth0_token_through_m2m", return_value={"access_token": "m2m_at"})
+    @patch("auth0_oauth_client.client.Auth0")
+    def test_connected_account_owner_deleted_in_auth0_falls_through_to_search(self, mock_auth0_cls, mock_m2m):
+        # A row whose owner no longer exists: the Management API answers 404, which auth0-python raises as
+        # Auth0Error. The login goes on through the search branch instead of failing.
+        owner_user_id = "auth0|deleted-owner"
+        row = self._create_connected_account(owner_user_id)
+        mock_auth0_cls.return_value.users.get.side_effect = Auth0Error(
+            status_code=404, error_code="inexistent_user", message="The user does not exist."
+        )
+        cache.set(f"_auth0_oauth_client_user_{self.GOOGLE_USER_ID}", _current_record())
+        client, request = self._setup_client_and_request(user_id=self.GOOGLE_USER_ID)
+
+        with (
+            patch.object(DjangoAuthClient, "_search_users_excluding_connection", return_value=[]) as mock_search,
+            patch.object(DjangoAuthClient, "_merge_and_link_accounts", return_value=[]) as mock_merge,
+        ):
             result = client.verify_account_linking(request)
 
-        self.assertFalse(result["is_pending_account_linking"])
-        self.assertTrue(result["is_account_linked"])
+        self.assertEqual(result, self.NOT_LINKED)
+        mock_auth0_cls.return_value.users.get.assert_called_once_with(id=owner_user_id)
+        mock_search.assert_called_once_with(LINKING_EMAIL, "google-oauth2")
+        mock_merge.assert_not_called()
+        row.refresh_from_db()
+        self.assertFalse(row.is_account_linked)
+
+    def test_connected_account_owner_without_usable_fields_falls_through_to_search(self):
+        owner_user_id = "facebook|owner"
+        row = self._create_connected_account(owner_user_id)
+        owners = {
+            "email missing": _owner_record("facebook", email=_MISSING),
+            "email null": _owner_record("facebook", email=None),
+            "email_verified false": _owner_record("facebook", email_verified=False),
+            "email_verified null": _owner_record("facebook", email_verified=None),
+            "email_verified missing": _owner_record("facebook", email_verified=_MISSING),
+            "email_verified as string": _owner_record("facebook", email_verified="true"),
+            "identities empty": {"email": LINKING_EMAIL, "email_verified": True, "identities": []},
+            "identities missing": {"email": LINKING_EMAIL, "email_verified": True},
+        }
+        for label, owner in owners.items():
+            with self.subTest(owner=label):
+                outcome = self._verify(_current_record(), owner=owner)
+
+                self.assertEqual(outcome.result, self.NOT_LINKED)
+                self._assert_not_linked(outcome, self.GOOGLE_USER_ID)
+                outcome.search.assert_called_once_with(LINKING_EMAIL, "google-oauth2")
+                row.refresh_from_db()
+                self.assertFalse(row.is_account_linked)
+
+    def test_connected_account_never_links_a_password_login(self):
+        # The row's provider follows the current login's provider, so a password login can only match a row
+        # whose provider is `auth0`. Even with a verified social owner, two social accounts are required.
+        current_user_id = "auth0|current"
+        row = self._create_connected_account("facebook|owner", provider="auth0")
+
+        outcome = self._verify(_current_record("auth0"), user_id=current_user_id, owner=_owner_record("facebook"))
+
+        self.assertEqual(outcome.result, self.NOT_LINKED)
+        self._assert_not_linked(outcome, current_user_id)
+        outcome.owner_read.assert_not_called()
+        outcome.search.assert_called_once_with(LINKING_EMAIL, PASSWORD_CONNECTION)
+        row.refresh_from_db()
+        self.assertFalse(row.is_account_linked)
+
+    @patch.object(DjangoAuthClient, "_get_auth0_token_through_m2m", return_value={"access_token": "m2m_at"})
+    @patch("auth0_oauth_client.client.Auth0")
+    def test_connected_account_owner_read_bypasses_the_user_cache(self, mock_auth0_cls, mock_m2m):
+        # The cached owner claims a verified social account; the fresh Management API read disagrees.
+        mock_users = mock_auth0_cls.return_value.users
+        fresh_reads = {
+            "password": ("auth0|owner", "auth0", True, "e-mail e senha"),
+            "unverified social": ("facebook|owner", "facebook", False, "Facebook"),
+        }
+        for fresh_label, (owner_user_id, fresh_provider, fresh_verified, friendly_name) in fresh_reads.items():
+            owner_cache_key = f"_auth0_oauth_client_user_{owner_user_id}"
+            row = self._create_connected_account(owner_user_id)
+            stale_cached_owner = _owner_record("facebook", email_verified=True)
+            mock_users.get.return_value = _owner_record(fresh_provider, email_verified=fresh_verified)
+            # The search returns the same owner, as it would, with the same fresh values.
+            candidate = _candidate_record(owner_user_id, fresh_provider, email_verified=fresh_verified)
+
+            for seed_owner_cache in (True, False):
+                with self.subTest(fresh_read=fresh_label, seed_owner_cache=seed_owner_cache):
+                    cache.clear()
+                    mock_users.reset_mock()
+                    cache.set(f"_auth0_oauth_client_user_{self.GOOGLE_USER_ID}", _current_record())
+                    if seed_owner_cache:
+                        cache.set(owner_cache_key, stale_cached_owner)
+                    client, request = self._setup_client_and_request(user_id=self.GOOGLE_USER_ID)
+
+                    with (
+                        patch.object(
+                            DjangoAuthClient, "_search_users_excluding_connection", return_value=[candidate]
+                        ) as mock_search,
+                        # A spy that runs the real method, so a wrong link would reach the faked Auth0 client.
+                        patch.object(
+                            DjangoAuthClient,
+                            "_merge_and_link_accounts",
+                            autospec=True,
+                            side_effect=DjangoAuthClient._merge_and_link_accounts,
+                        ) as mock_merge,
+                    ):
+                        result = client.verify_account_linking(request)
+
+                    outcome = SimpleNamespace(
+                        result=result, session=request.session, search=mock_search, merge=mock_merge
+                    )
+                    self._assert_manual_path(outcome, owner_user_id, fresh_provider, friendly_name)
+                    mock_users.link_user_account.assert_not_called()
+                    mock_users.update.assert_not_called()
+                    mock_auth0_cls.assert_called_with("test.auth0.com", "m2m_at")
+                    mock_users.get.assert_called_once_with(id=owner_user_id)
+                    if seed_owner_cache:
+                        self.assertEqual(cache.get(owner_cache_key), stale_cached_owner)
+                    else:
+                        self.assertIsNone(cache.get(owner_cache_key))
+                    row.refresh_from_db()
+                    self.assertFalse(row.is_account_linked)
+            row.delete()
+
+    # endregion
+
+    # region Search branch, social login
+
+    def test_social_login_into_password_account_takes_manual_path(self):
+        candidate = _candidate_record(self.PASSWORD_USER_ID, "auth0", email_verified=True)
+        AccountToken.objects.create(user_id=self.PASSWORD_USER_ID, refresh_token="rt_existing")
+
+        with self.assertLogs("auth0_oauth_client", "DEBUG") as logs:
+            outcome = self._verify(_current_record(), [candidate])
+
+        self._assert_manual_path(outcome, self.PASSWORD_USER_ID, "auth0", "e-mail e senha")
+        outcome.search.assert_called_once_with(LINKING_EMAIL, "google-oauth2")
+        self._assert_logged(
+            logs,
+            [
+                (
+                    "INFO",
+                    self.WITHHELD_MESSAGE,
+                    ("search", self.GOOGLE_USER_ID, self.PASSWORD_USER_ID, "auth0", True, True),
+                )
+            ],
+        )
+
+    def test_social_login_into_unverified_password_account_takes_manual_path(self):
+        candidate = _candidate_record(self.PASSWORD_USER_ID, "auth0", email_verified=False)
+        AccountToken.objects.create(user_id=self.PASSWORD_USER_ID, refresh_token="rt_existing")
+
+        outcome = self._verify(_current_record(), [candidate])
+
+        self._assert_manual_path(outcome, self.PASSWORD_USER_ID, "auth0", "e-mail e senha")
+
+    def test_unverified_social_login_into_password_account_takes_manual_path(self):
+        for candidate_verified in (True, False):
+            with self.subTest(candidate_email_verified=candidate_verified):
+                candidate = _candidate_record(self.PASSWORD_USER_ID, "auth0", email_verified=candidate_verified)
+
+                with self.assertLogs("auth0_oauth_client", "DEBUG") as logs:
+                    outcome = self._verify(_current_record(email_verified=False), [candidate])
+
+                self._assert_manual_path(outcome, self.PASSWORD_USER_ID, "auth0", "e-mail e senha")
+                self._assert_logged(
+                    logs,
+                    [
+                        (
+                            "INFO",
+                            self.WITHHELD_MESSAGE,
+                            ("search", self.GOOGLE_USER_ID, self.PASSWORD_USER_ID, "auth0", False, candidate_verified),
+                        )
+                    ],
+                )
+
+    def test_auto_links_two_verified_social_accounts(self):
+        candidate = _candidate_record(self.FACEBOOK_USER_ID, "facebook")
+        AccountToken.objects.create(user_id=self.FACEBOOK_USER_ID, refresh_token="rt_facebook")
+        # The current user's own Token Vault row is marked linked too, as `complete_account_linking` does.
+        own_row = self._create_connected_account(self.GOOGLE_USER_ID)
+
+        with self.assertLogs("auth0_oauth_client", "DEBUG") as logs:
+            outcome = self._verify(_current_record(), [candidate])
+
+        self.assertEqual(outcome.result, self.LINKED)
+        outcome.merge.assert_called_once_with(self.FACEBOOK_USER_ID, "google-oauth2", self.GOOGLE_USER_ID)
+        outcome.owner_read.assert_not_called()
+        session_data = outcome.session[DjangoAuthClient.SESSION_KEY_STATE]
+        self.assertEqual(session_data["userinfo"]["sub"], self.FACEBOOK_USER_ID)
+        self.assertEqual(session_data["refresh_token"], "rt_facebook")
+        self.assertNotIn(DjangoAuthClient.SESSION_KEY_ACCOUNT_LINKING_TX, outcome.session)
+        self.assertTrue(
+            AccountLinking.objects.filter(
+                primary_user_id=self.FACEBOOK_USER_ID,
+                secondary_provider="google-oauth2",
+                secondary_user_id=self.GOOGLE_USER_ID,
+            ).exists()
+        )
+        own_row.refresh_from_db()
+        self.assertTrue(own_row.is_account_linked)
+        self._assert_logged(
+            logs, [("INFO", self.AUTO_LINK_MESSAGE, ("search", self.FACEBOOK_USER_ID, self.GOOGLE_USER_ID))]
+        )
+
+    def test_unverified_or_malformed_email_verified_takes_manual_path(self):
+        values = {"false": False, "missing": _MISSING, "null": None, "string true": "true", "integer one": 1}
+        for side in ("candidate", "current"):
+            for label, value in values.items():
+                with self.subTest(side=side, email_verified=label):
+                    current = _current_record(email_verified=value if side == "current" else True)
+                    candidate = _candidate_record(
+                        self.FACEBOOK_USER_ID, "facebook", email_verified=value if side == "candidate" else True
+                    )
+
+                    outcome = self._verify(current, [candidate])
+
+                    self._assert_manual_path(outcome, self.FACEBOOK_USER_ID, "facebook", "Facebook")
+
+    def test_candidate_provider_without_friendly_name_uses_the_raw_provider(self):
+        # A passwordless `email` connection has no friendly name; the pending path must not raise.
+        candidate = _candidate_record("email|existing", "email")
+
+        outcome = self._verify(_current_record(), [candidate])
+
+        self._assert_manual_path(outcome, "email|existing", "email", "email")
+
+    def test_search_candidate_with_another_email_is_ignored(self):
+        candidate_user_id = self.FACEBOOK_USER_ID
+        emails = {
+            "another e-mail": "someone.else@example.com",
+            "missing": _MISSING,
+            "null": None,
+            "not a string": ["victim.linking@example.com"],
+        }
+        for label, email in emails.items():
+            with self.subTest(candidate_email=label):
+                candidate = _candidate_record(candidate_user_id, "facebook", email=email)
+
+                with self.assertLogs("auth0_oauth_client", "DEBUG") as logs:
+                    outcome = self._verify(_current_record(), [candidate])
+
+                self.assertEqual(outcome.result, self.NOT_LINKED)
+                self.assertNotIn(DjangoAuthClient.SESSION_KEY_ACCOUNT_LINKING_TX, outcome.session)
+                self._assert_not_linked(outcome, self.GOOGLE_USER_ID)
+                self._assert_logged(
+                    logs, [("WARNING", self.CANDIDATE_IGNORED_MESSAGE, (self.GOOGLE_USER_ID, candidate_user_id))]
+                )
+                self.assertNotIn("someone.else", repr([record.args for record in logs.records]))
+
+    def test_search_candidate_email_matches_ignoring_case(self):
+        candidate = _candidate_record(self.PASSWORD_USER_ID, "auth0", email=LINKING_EMAIL.upper())
+
+        outcome = self._verify(_current_record(), [candidate])
+
+        self._assert_manual_path(outcome, self.PASSWORD_USER_ID, "auth0", "e-mail e senha")
+
+    def test_ignored_candidate_does_not_count_as_a_match(self):
+        # Only the matching candidate is considered, so it is the single candidate and the rules apply to it.
+        candidates = [
+            _candidate_record("facebook|other-email", "facebook", email="someone.else@example.com"),
+            _candidate_record(self.FACEBOOK_USER_ID, "facebook"),
+        ]
+        AccountToken.objects.create(user_id=self.FACEBOOK_USER_ID, refresh_token="rt_facebook")
+
+        with self.assertLogs("auth0_oauth_client", "DEBUG") as logs:
+            outcome = self._verify(_current_record(), candidates)
+
+        self.assertEqual(outcome.result, self.LINKED)
+        outcome.merge.assert_called_once_with(self.FACEBOOK_USER_ID, "google-oauth2", self.GOOGLE_USER_ID)
+        self._assert_logged(
+            logs,
+            [
+                ("WARNING", self.CANDIDATE_IGNORED_MESSAGE, (self.GOOGLE_USER_ID, "facebook|other-email")),
+                ("INFO", self.AUTO_LINK_MESSAGE, ("search", self.FACEBOOK_USER_ID, self.GOOGLE_USER_ID)),
+            ],
+        )
+
+    def test_multiple_candidates_never_link_automatically(self):
+        candidates = [
+            _candidate_record("facebook|first", "facebook"),
+            _candidate_record("facebook|second", "facebook"),
+        ]
+
+        with self.assertLogs("auth0_oauth_client", "WARNING") as logs:
+            outcome = self._verify(_current_record(), candidates)
+
+        self._assert_manual_path(outcome, "facebook|first", "facebook", "Facebook")
+        self._assert_logged(logs, [("WARNING", self.MULTIPLE_CANDIDATES_MESSAGE, (2, self.GOOGLE_USER_ID))])
+
+    # endregion
+
+    # region Search branch, password login
 
     @patch.object(DjangoAuthClient, "_search_users_excluding_connection")
     @patch.object(DjangoAuthClient, "get_user_by_id")
@@ -615,6 +1202,7 @@ class VerifyAccountLinkingTest(TransactionTestCase):
         mock_search.return_value = [
             {
                 "user_id": existing_user_id,
+                "email": "user@example.com",
                 "identities": [{"provider": "google-oauth2", "connection": "google-oauth2"}],
             }
         ]
@@ -627,6 +1215,215 @@ class VerifyAccountLinkingTest(TransactionTestCase):
         pending = request.session[DjangoAuthClient.SESSION_KEY_ACCOUNT_LINKING_TX]
         self.assertEqual(pending["primary_user_id"], existing_user_id)
         self.assertEqual(pending["secondary_user_id"], user_id)
+
+    def test_password_login_with_older_social_candidate_takes_manual_path(self):
+        current_user_id = "auth0|current"
+        current = _current_record("auth0", created_at="2026-01-01T00:00:00.000Z")
+        candidate = _candidate_record("google-oauth2|existing", "google-oauth2", created_at="2025-12-31T23:59:59.999Z")
+
+        with self.assertNoLogs("auth0_oauth_client", "INFO"):
+            outcome = self._verify(current, [candidate], user_id=current_user_id)
+
+        self._assert_manual_path(
+            outcome,
+            "google-oauth2|existing",
+            "google-oauth2",
+            "Google",
+            secondary_user_id=current_user_id,
+            secondary_provider="auth0",
+        )
+
+    def test_password_login_with_newer_social_candidate_skips_linking(self):
+        current_user_id = "auth0|current"
+        candidate_user_id = "google-oauth2|newer"
+        current = _current_record("auth0", created_at="2026-06-01T12:00:00.000Z")
+        candidate = _candidate_record(candidate_user_id, "google-oauth2", created_at="2026-11-17T09:30:00.000Z")
+
+        with self.assertLogs("auth0_oauth_client", "DEBUG") as logs:
+            outcome = self._verify(current, [candidate], user_id=current_user_id)
+
+        self.assertEqual(outcome.result, self.NOT_LINKED)
+        self.assertNotIn(DjangoAuthClient.SESSION_KEY_ACCOUNT_LINKING_TX, outcome.session)
+        self._assert_not_linked(outcome, current_user_id)
+        self._assert_logged(logs, [("INFO", self.SKIPPED_MESSAGE, (current_user_id, candidate_user_id))])
+
+    def test_created_at_is_compared_as_an_instant_not_as_text(self):
+        # 2025-12-31T22:00:00-03:00 (America/Sao_Paulo) is 2026-01-01T01:00:00Z: later than 00:30Z, although
+        # it sorts first as text.
+        current_user_id = "auth0|current"
+        candidate_user_id = "google-oauth2|existing"
+        cases = {
+            "candidate newer across the year boundary": ("2026-01-01T00:30:00+00:00", "2025-12-31T22:00:00-03:00"),
+            "candidate older across the year boundary": ("2025-12-31T22:00:00-03:00", "2026-01-01T00:30:00Z"),
+        }
+        for label, (current_created_at, candidate_created_at) in cases.items():
+            with self.subTest(label):
+                current = _current_record("auth0", created_at=current_created_at)
+                candidate = _candidate_record(candidate_user_id, "google-oauth2", created_at=candidate_created_at)
+
+                outcome = self._verify(current, [candidate], user_id=current_user_id)
+
+                if label.startswith("candidate newer"):
+                    self.assertEqual(outcome.result, self.NOT_LINKED)
+                    self.assertNotIn(DjangoAuthClient.SESSION_KEY_ACCOUNT_LINKING_TX, outcome.session)
+                    self._assert_not_linked(outcome, current_user_id)
+                else:
+                    self._assert_manual_path(
+                        outcome,
+                        candidate_user_id,
+                        "google-oauth2",
+                        "Google",
+                        secondary_user_id=current_user_id,
+                        secondary_provider="auth0",
+                    )
+
+    def test_equal_missing_or_unusable_created_at_keeps_manual_path(self):
+        current_user_id = "auth0|current"
+        candidate_user_id = "google-oauth2|existing"
+        cases = {
+            "equal": ("2026-01-01T00:00:00.000Z", "2026-01-01T00:00:00.000Z"),
+            "equal instant in another offset": ("2026-01-01T00:00:00Z", "2025-12-31T21:00:00-03:00"),
+            "missing on current": (_MISSING, "2026-02-01T00:00:00Z"),
+            "missing on candidate": ("2026-01-01T00:00:00Z", _MISSING),
+            "null on candidate": ("2026-01-01T00:00:00Z", None),
+            "unparseable on current": ("yesterday", "2026-02-01T00:00:00Z"),
+            "unparseable on candidate": ("2026-01-01T00:00:00Z", "yesterday"),
+            "naive on current": ("2026-01-01T00:00:00", "2026-02-01T00:00:00Z"),
+            "naive on candidate": ("2026-01-01T00:00:00Z", "2026-02-01T00:00:00"),
+            "not a string on candidate": ("2026-01-01T00:00:00Z", 1769904000),
+        }
+        for label, (current_created_at, candidate_created_at) in cases.items():
+            with self.subTest(label):
+                current = _current_record("auth0", created_at=current_created_at)
+                candidate = _candidate_record(candidate_user_id, "google-oauth2", created_at=candidate_created_at)
+
+                outcome = self._verify(current, [candidate], user_id=current_user_id)
+
+                self._assert_manual_path(
+                    outcome,
+                    candidate_user_id,
+                    "google-oauth2",
+                    "Google",
+                    secondary_user_id=current_user_id,
+                    secondary_provider="auth0",
+                )
+
+    def _password_candidate_in_another_database(self, user_id, created_at):
+        # The search excludes the current connection, so a password candidate on a password login can only come
+        # from another database connection.
+        return {
+            "user_id": user_id,
+            "identities": [{"provider": "auth0", "connection": "Another-Database"}],
+            "email": LINKING_EMAIL,
+            "email_verified": True,
+            "created_at": created_at,
+        }
+
+    def test_password_login_with_newer_password_candidate_skips_linking(self):
+        # The newer-account rule holds whatever the candidate's provider is.
+        current_user_id = "auth0|current"
+        candidate_user_id = "auth0|other-database"
+        current = _current_record("auth0", created_at="2026-01-01T00:00:00Z")
+        candidate = self._password_candidate_in_another_database(candidate_user_id, "2026-02-01T00:00:00Z")
+
+        with self.assertLogs("auth0_oauth_client", "DEBUG") as logs:
+            outcome = self._verify(current, [candidate], user_id=current_user_id)
+
+        self.assertEqual(outcome.result, self.NOT_LINKED)
+        self.assertNotIn(DjangoAuthClient.SESSION_KEY_ACCOUNT_LINKING_TX, outcome.session)
+        self._assert_not_linked(outcome, current_user_id)
+        self._assert_logged(logs, [("INFO", self.SKIPPED_MESSAGE, (current_user_id, candidate_user_id))])
+
+    def test_password_login_with_older_password_candidate_takes_manual_path(self):
+        current_user_id = "auth0|current"
+        candidate_user_id = "auth0|other-database"
+        current = _current_record("auth0", created_at="2026-02-01T00:00:00Z")
+        candidate = self._password_candidate_in_another_database(candidate_user_id, "2026-01-01T00:00:00Z")
+
+        outcome = self._verify(current, [candidate], user_id=current_user_id)
+
+        self.assertEqual(outcome.result, self.PENDING)
+        pending = outcome.session[DjangoAuthClient.SESSION_KEY_ACCOUNT_LINKING_TX]
+        self.assertEqual(pending["primary_user_id"], candidate_user_id)
+        self.assertEqual(pending["primary_connection_name"], "Another-Database")
+        self.assertEqual(pending["primary_provider_friendly_name"], "e-mail e senha")
+        self._assert_not_linked(outcome, current_user_id)
+
+    def test_social_login_with_newer_password_candidate_skips_linking(self):
+        # An older Google account and a password account registered later with the same e-mail (possibly by
+        # someone else): confirming would move the Google identity, and her data, into the newer account.
+        current = _current_record(created_at="2026-01-01T00:00:00.000Z")
+        candidate = _candidate_record(self.PASSWORD_USER_ID, "auth0", created_at="2026-03-01T00:00:00.000Z")
+
+        with self.assertLogs("auth0_oauth_client", "DEBUG") as logs:
+            outcome = self._verify(current, [candidate])
+
+        self.assertEqual(outcome.result, self.NOT_LINKED)
+        self.assertNotIn(DjangoAuthClient.SESSION_KEY_ACCOUNT_LINKING_TX, outcome.session)
+        self._assert_not_linked(outcome, self.GOOGLE_USER_ID)
+        self._assert_logged(logs, [("INFO", self.SKIPPED_MESSAGE, (self.GOOGLE_USER_ID, self.PASSWORD_USER_ID))])
+
+    def test_social_login_with_newer_verified_social_candidate_skips_linking(self):
+        current = _current_record(created_at="2026-01-01T00:00:00.000Z")
+        candidate = _candidate_record(self.FACEBOOK_USER_ID, "facebook", created_at="2026-01-01T00:00:00.001Z")
+        AccountToken.objects.create(user_id=self.FACEBOOK_USER_ID, refresh_token="rt_facebook")
+
+        with self.assertLogs("auth0_oauth_client", "DEBUG") as logs:
+            outcome = self._verify(current, [candidate])
+
+        self.assertEqual(outcome.result, self.NOT_LINKED)
+        self.assertNotIn(DjangoAuthClient.SESSION_KEY_ACCOUNT_LINKING_TX, outcome.session)
+        self._assert_not_linked(outcome, self.GOOGLE_USER_ID)
+        self._assert_logged(logs, [("INFO", self.SKIPPED_MESSAGE, (self.GOOGLE_USER_ID, self.FACEBOOK_USER_ID))])
+
+    def test_social_login_with_older_password_candidate_takes_manual_path(self):
+        current = _current_record(created_at="2026-11-17T09:30:00.000Z")
+        candidate = _candidate_record(self.PASSWORD_USER_ID, "auth0", created_at="2026-06-01T12:00:00.000Z")
+
+        outcome = self._verify(current, [candidate])
+
+        self._assert_manual_path(outcome, self.PASSWORD_USER_ID, "auth0", "e-mail e senha")
+
+    def test_social_login_with_older_or_same_age_verified_social_candidate_links_automatically(self):
+        cases = {
+            "older": ("2026-11-17T09:30:00.000Z", "2026-06-01T12:00:00.000Z"),
+            "same instant": ("2026-01-01T00:00:00Z", "2025-12-31T21:00:00-03:00"),
+        }
+        AccountToken.objects.create(user_id=self.FACEBOOK_USER_ID, refresh_token="rt_facebook")
+        for label, (current_created_at, candidate_created_at) in cases.items():
+            with self.subTest(label):
+                AccountLinking.objects.all().delete()
+                current = _current_record(created_at=current_created_at)
+                candidate = _candidate_record(self.FACEBOOK_USER_ID, "facebook", created_at=candidate_created_at)
+
+                outcome = self._verify(current, [candidate])
+
+                self.assertEqual(outcome.result, self.LINKED)
+                outcome.merge.assert_called_once_with(self.FACEBOOK_USER_ID, "google-oauth2", self.GOOGLE_USER_ID)
+
+    def test_multiple_candidates_on_password_login_apply_the_newer_rule_to_the_first(self):
+        current_user_id = "auth0|current"
+        current = _current_record("auth0", created_at="2026-01-01T00:00:00Z")
+        candidates = [
+            _candidate_record("google-oauth2|newer", "google-oauth2", created_at="2026-02-01T00:00:00Z"),
+            _candidate_record("facebook|older", "facebook", created_at="2025-01-01T00:00:00Z"),
+        ]
+
+        with self.assertLogs("auth0_oauth_client", "DEBUG") as logs:
+            outcome = self._verify(current, candidates, user_id=current_user_id)
+
+        self.assertEqual(outcome.result, self.NOT_LINKED)
+        self.assertNotIn(DjangoAuthClient.SESSION_KEY_ACCOUNT_LINKING_TX, outcome.session)
+        self._assert_not_linked(outcome, current_user_id)
+        self._assert_logged(
+            logs,
+            [
+                ("WARNING", self.MULTIPLE_CANDIDATES_MESSAGE, (2, current_user_id)),
+                ("INFO", self.SKIPPED_MESSAGE, (current_user_id, "google-oauth2|newer")),
+            ],
+        )
+
+    # endregion
 
     @patch.object(DjangoAuthClient, "_search_users_excluding_connection")
     @patch.object(DjangoAuthClient, "get_user_by_id")
@@ -656,6 +1453,77 @@ class VerifyAccountLinkingTest(TransactionTestCase):
         result = client.verify_account_linking(request)
         self.assertFalse(result["is_pending_account_linking"])
         self.assertFalse(result["is_account_linked"])
+
+    def test_returns_not_linked_without_a_session(self):
+        client = DjangoAuthClient()
+        request = _make_request_with_session()
+
+        self.assertEqual(client.verify_account_linking(request), self.NOT_LINKED)
+
+
+class AccountLinkingHelpersTest(TestCase):
+    def test_is_verified_only_for_boolean_true(self):
+        client = DjangoAuthClient()
+        self.assertTrue(client._is_verified({"email_verified": True}))
+        for value in (False, None, "true", 1, {}):
+            with self.subTest(email_verified=value):
+                self.assertFalse(client._is_verified({"email_verified": value}))
+        self.assertFalse(client._is_verified({}))
+
+    def test_primary_provider_reads_the_first_identity(self):
+        client = DjangoAuthClient()
+        record = {"identities": [{"provider": "auth0"}, {"provider": "google-oauth2"}]}
+        self.assertEqual(client._primary_provider(record), "auth0")
+
+    def test_primary_provider_is_none_for_unusable_identities(self):
+        client = DjangoAuthClient()
+        records = {
+            "missing": {},
+            "null": {"identities": None},
+            "empty": {"identities": []},
+            "not a list": {"identities": "auth0"},
+            "first not a dict": {"identities": ["auth0"]},
+            "provider missing": {"identities": [{"connection": "google-oauth2"}]},
+            "provider not a string": {"identities": [{"provider": 1}]},
+        }
+        for label, record in records.items():
+            with self.subTest(label):
+                self.assertIsNone(client._primary_provider(record))
+
+    def test_is_social_account(self):
+        client = DjangoAuthClient()
+        self.assertTrue(client._is_social_account({"identities": [{"provider": "facebook"}]}))
+        self.assertFalse(client._is_social_account({"identities": [{"provider": "auth0"}]}))
+        self.assertFalse(client._is_social_account({"identities": []}))
+
+    def test_parse_created_at_returns_an_aware_datetime(self):
+        client = DjangoAuthClient()
+        expected = datetime(2026, 1, 1, tzinfo=UTC)
+        for value in ("2026-01-01T00:00:00.000Z", "2026-01-01T00:00:00Z", "2025-12-31T21:00:00-03:00"):
+            with self.subTest(value):
+                self.assertEqual(client._parse_created_at(value), expected)
+
+    def test_parse_created_at_is_none_for_unusable_values(self):
+        client = DjangoAuthClient()
+        for value in ("2026-01-01T00:00:00", "yesterday", "", 1767225600, None):
+            with self.subTest(value=value):
+                self.assertIsNone(client._parse_created_at(value))
+
+    def test_is_created_after_only_when_strictly_later_and_both_known(self):
+        client = DjangoAuthClient()
+        cases = {
+            "later": ("2026-01-01T00:00:00.001Z", "2026-01-01T00:00:00Z", True),
+            "earlier": ("2025-12-31T23:59:59Z", "2026-01-01T00:00:00Z", False),
+            "same instant in another offset": ("2025-12-31T21:00:00-03:00", "2026-01-01T00:00:00Z", False),
+            "record unknown": (None, "2026-01-01T00:00:00Z", False),
+            "reference unknown": ("2026-01-01T00:00:00Z", "yesterday", False),
+        }
+        for label, (record_created_at, reference_created_at, expected) in cases.items():
+            with self.subTest(label):
+                self.assertIs(
+                    client._is_created_after({"created_at": record_created_at}, {"created_at": reference_created_at}),
+                    expected,
+                )
 
 
 class PendingAccountLinkingTest(TestCase):
@@ -1023,6 +1891,39 @@ class GetUserByIdTest(TestCase):
         self.assertEqual(mock_auth0_instance.users.get.call_count, 2)
 
 
+class GetUserByIdUncachedTest(TestCase):
+    CACHE_KEY = "_auth0_oauth_client_user_auth0|user1"
+
+    def setUp(self):
+        cache.clear()
+
+    @patch.object(DjangoAuthClient, "_get_auth0_token_through_m2m", return_value={"access_token": "m2m_at"})
+    @patch("auth0_oauth_client.client.Auth0")
+    def test_reads_from_management_api_without_writing_the_cache(self, mock_auth0_cls, mock_m2m):
+        mock_auth0_cls.return_value.users.get.return_value = {"user_id": "auth0|user1", "email_verified": True}
+
+        client = DjangoAuthClient()
+        result = client._get_user_by_id_uncached("auth0|user1")
+
+        self.assertEqual(result, {"user_id": "auth0|user1", "email_verified": True})
+        mock_auth0_cls.assert_called_once_with("test.auth0.com", "m2m_at")
+        mock_auth0_cls.return_value.users.get.assert_called_once_with(id="auth0|user1")
+        self.assertIsNone(cache.get(self.CACHE_KEY))
+
+    @patch.object(DjangoAuthClient, "_get_auth0_token_through_m2m", return_value={"access_token": "m2m_at"})
+    @patch("auth0_oauth_client.client.Auth0")
+    def test_ignores_and_keeps_a_cached_record(self, mock_auth0_cls, mock_m2m):
+        cached = {"user_id": "auth0|user1", "email_verified": True}
+        cache.set(self.CACHE_KEY, cached)
+        mock_auth0_cls.return_value.users.get.return_value = {"user_id": "auth0|user1", "email_verified": False}
+
+        client = DjangoAuthClient()
+        result = client._get_user_by_id_uncached("auth0|user1")
+
+        self.assertEqual(result, {"user_id": "auth0|user1", "email_verified": False})
+        self.assertEqual(cache.get(self.CACHE_KEY), cached)
+
+
 class GetUserInfoTest(TestCase):
     def test_returns_userinfo_from_session(self):
         client = DjangoAuthClient()
@@ -1064,6 +1965,50 @@ class SearchUsersExcludingConnectionTest(TestCase):
         result = client._search_users_excluding_connection("user@example.com", "google-oauth2")
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["user_id"], "auth0|found")
+        mock_auth0_cls.assert_called_once_with("test.auth0.com", "m2m_at")
+        mock_auth0_instance.users.list.assert_called_once_with(
+            q='email:"user@example.com" AND NOT identities.connection:"google-oauth2"',
+            fields=[
+                "user_id",
+                "identities.provider",
+                "identities.connection",
+                "email",
+                "email_verified",
+                "created_at",
+            ],
+        )
+
+    @patch.object(DjangoAuthClient, "_get_auth0_token_through_m2m", return_value={"access_token": "m2m_at"})
+    @patch("auth0_oauth_client.client.Auth0")
+    def test_escapes_quotes_and_backslashes_inside_the_quoted_terms(self, mock_auth0_cls, mock_m2m):
+        mock_users = mock_auth0_cls.return_value.users
+        mock_users.list.return_value = {"users": []}
+        cases = {
+            "quote and backslash": (
+                'a"b\\c@example.com',
+                "google-oauth2",
+                r'email:"a\"b\\c@example.com" AND NOT identities.connection:"google-oauth2"',
+            ),
+            # Without escaping, the quote would close the term and `OR email:*` would match every user.
+            "term breakout attempt": (
+                'x@example.com" OR email:"*',
+                "google-oauth2",
+                r'email:"x@example.com\" OR email:\"*" AND NOT identities.connection:"google-oauth2"',
+            ),
+            "connection name": (
+                "user@example.com",
+                'odd"connection\\',
+                r'email:"user@example.com" AND NOT identities.connection:"odd\"connection\\"',
+            ),
+        }
+        client = DjangoAuthClient()
+        for label, (email, connection_name, expected_query) in cases.items():
+            with self.subTest(label):
+                mock_users.list.reset_mock()
+
+                client._search_users_excluding_connection(email, connection_name)
+
+                self.assertEqual(mock_users.list.call_args.kwargs["q"], expected_query)
 
 
 class UpdateUserTest(TestCase):
@@ -1369,6 +2314,25 @@ class PingTest(TestCase):
         with self.assertRaises(Auth0PingError) as ctx:
             client.ping()
         self.assertEqual(ctx.exception.stage, "token_claims")
+
+
+class GetAccessTokenForConnectionTest(TestCase):
+    @patch("auth0_oauth_client.client.GetToken")
+    def test_exchanges_the_session_refresh_token(self, mock_get_token_cls):
+        # Regression: the method called itself with the refresh token in place of the request.
+        mock_exchange = mock_get_token_cls.return_value.access_token_for_connection
+        mock_exchange.return_value = {"access_token": "fed_at", "expires_in": 3600, "scope": "calendar"}
+        client = DjangoAuthClient()
+        request = _make_request_with_session()
+        request.session[DjangoAuthClient.SESSION_KEY_STATE] = _make_session_data(refresh_token="rt_session")
+
+        result = client.get_access_token_for_connection(request, "google-oauth2")
+
+        self.assertEqual(result["access_token"], "fed_at")
+        mock_get_token_cls.assert_called_once_with("test.auth0.com", "test-client-id", "test-client-secret")
+        mock_exchange.assert_called_once()
+        self.assertEqual(mock_exchange.call_args.kwargs["subject_token"], "rt_session")
+        self.assertEqual(mock_exchange.call_args.kwargs["connection"], "google-oauth2")
 
 
 class GetAccessTokenForConnectionUsingUserRefreshTokenTest(TestCase):

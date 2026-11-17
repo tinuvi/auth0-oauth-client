@@ -3,6 +3,8 @@ import logging
 import time
 
 from collections.abc import Iterable
+from collections.abc import Mapping
+from datetime import datetime
 from typing import Any
 from typing import cast
 from urllib.parse import parse_qs
@@ -49,6 +51,18 @@ from auth0_oauth_client.typing import UserinfoPayload
 from auth0_oauth_client.typing import VerifyAccountLinkingResult
 
 _logger = logging.getLogger("auth0_oauth_client")
+
+
+def _escape_lucene_quoted_term(value: str) -> str:
+    """Escape a value placed inside a double-quoted term of an Auth0 user search query.
+
+    Auth0 user search v3 takes Lucene query syntax
+    (https://auth0.com/docs/manage-users/user-search/user-search-query-syntax). In the Lucene classic query
+    parser a quoted term is `"\\"" (<_QUOTED_CHAR>)* "\\""`, where `_QUOTED_CHAR` is any character except `"`
+    and `\\`, or a backslash followed by any character (`QueryParser.jj`). So only `\\` and `"` need escaping
+    there, the backslash first.
+    """
+    return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
 class DjangoAuthClient:
@@ -454,8 +468,14 @@ class DjangoAuthClient:
         return {"success": True}
 
     def verify_account_linking(self, request) -> VerifyAccountLinkingResult:
-        from auth0_oauth_client.models import AccountLinking
-        from auth0_oauth_client.models import AccountToken
+        """Decide whether the current login is linked into another Auth0 user with the same e-mail.
+
+        A login is linked automatically only when the current account and the candidate are both social
+        accounts whose e-mails are both verified (`email_verified` is exactly `True`). Every other match takes
+        the manual path (a pending payload the user confirms by logging in with the candidate account), and
+        every unknown value fails closed into it. A candidate created after the current account is never linked
+        with it, whatever the providers: linking only ever merges the newer account into the older one.
+        """
         from auth0_oauth_client.models import ConnectedAccount
 
         session_data = self._get_session(request)
@@ -468,96 +488,215 @@ class DjangoAuthClient:
         userinfo = self.get_user_by_id(user_id)
         user_email = userinfo["email"]
         current_account_provider = userinfo["identities"][0]["provider"]
+        current_verified = self._is_verified(userinfo)
 
-        entries = ConnectedAccount.objects.filter(
-            is_account_linked=False, email=user_email, provider=current_account_provider
-        ).exclude(user_id_owner=user_id)
-        if entries.exists():
-            connected_account_entry = entries.first()
-            assert connected_account_entry is not None  # noqa: S101 — type narrowing for the type checker
-            primary_user_id = connected_account_entry.user_id_owner
-            result = self._merge_and_link_accounts(primary_user_id, current_account_provider, user_id)
-            session_data["userinfo"]["sub"] = primary_user_id
-            session_data["refresh_token"] = AccountToken.objects.get(user_id=primary_user_id).refresh_token
-            self._store_session(request, session_data)
-            AccountLinking.objects.update_or_create(
-                primary_user_id=primary_user_id,
-                secondary_provider=current_account_provider,
-                secondary_user_id=user_id,
+        # ConnectedAccount branch. The row's e-mail is the owner's LOGIN e-mail at connect time (see
+        # `complete_connect_account`), not the connected provider account's, so it proves nothing on its own.
+        # The owner is read fresh from the Management API, bypassing the 24 h user cache.
+        connected_account_entry = (
+            ConnectedAccount.objects.filter(
+                is_account_linked=False, email=user_email, provider=current_account_provider
             )
-            connected_account_entry.is_account_linked = True
-            connected_account_entry.save()
-            _logger.debug(
-                "Merged and linked accounts for user %s. Returned result: %s",
+            .exclude(user_id_owner=user_id)
+            .first()
+        )
+        if connected_account_entry is not None:
+            owner_user_id = connected_account_entry.user_id_owner
+            owner: UserDetailsPayload | None = None
+            # Only a verified social login can be linked automatically, so the owner is read only for one.
+            if self._is_social_provider(current_account_provider) and current_verified:
+                try:
+                    owner = self._get_user_by_id_uncached(owner_user_id)
+                except Auth0Error as exc:
+                    # An Auth0 API error (for example 404 for an owner deleted in Auth0, 429 or 5xx) never links and
+                    # never fails the login. A network error (requests ConnectionError or Timeout, which auth0-python
+                    # does not wrap) propagates, like on the other Management API calls.
+                    _logger.warning(
+                        "Account linking owner read failed branch=connected_account candidate_user_id=%s "
+                        "status_code=%s",
+                        owner_user_id,
+                        exc.status_code,
+                    )
+            owner_verified = self._is_verified(owner) if owner is not None else None
+            # As in the search branch, the owner stays primary, so it must not be newer than the current account.
+            is_eligible_automatic_account_linking = (
+                owner is not None
+                and self._is_social_account(owner)
+                and self._is_same_email(owner.get("email"), user_email)
+                and owner_verified
+                and not self._is_created_after(owner, userinfo)
+            )
+            if is_eligible_automatic_account_linking:
+                return self._link_automatically(
+                    request, session_data, owner_user_id, current_account_provider, user_id, "connected_account"
+                )
+            # The row is left untouched and the search branch decides, exactly as if no row had matched. An owner
+            # that was not read is logged with an unknown (`None`) provider and verification.
+            self._log_withheld(
+                "connected_account",
                 user_id,
-                result,
+                owner_user_id,
+                self._primary_provider(owner) if owner is not None else None,
+                current_verified,
+                owner_verified,
             )
-            return {
-                "is_pending_account_linking": False,
-                "is_account_linked": True,
-            }
-        else:
-            number_of_available_connections = len(self.connections_for_account_linking)
-            account_link_verification_required = len(userinfo["identities"]) < number_of_available_connections
-            if account_link_verification_required:
-                current_account_connection_name = userinfo["identities"][0]["connection"]
-                existing_accounts = self._search_users_excluding_connection(user_email, current_account_connection_name)
-                if existing_accounts:
-                    existing_account = existing_accounts[0]
-                    existing_account_user_id = existing_account["user_id"]
-                    existing_account_provider = existing_account["identities"][0]["provider"]
-                    is_eligible_automatic_account_linking = self._is_social_provider(current_account_provider)
+
+        number_of_available_connections = len(self.connections_for_account_linking)
+        account_link_verification_required = len(userinfo["identities"]) < number_of_available_connections
+        if account_link_verification_required:
+            current_account_connection_name = userinfo["identities"][0]["connection"]
+            found_users = self._search_users_excluding_connection(user_email, current_account_connection_name)
+            # Every outcome below uses the candidate, so a result whose own e-mail does not match the current one
+            # is never trusted: it is ignored as if the search had not returned it.
+            candidates: list[SearchUserResponseBody] = []
+            for found_user in found_users:
+                if self._is_same_email(found_user.get("email"), user_email):
+                    candidates.append(found_user)
+                else:
+                    _logger.warning(
+                        "Account linking candidate ignored, e-mail mismatch branch=search current_user_id=%s "
+                        "candidate_user_id=%s",
+                        user_id,
+                        found_user.get("user_id"),
+                    )
+            if candidates:
+                if len(candidates) > 1:
+                    _logger.warning(
+                        "Multiple account linking candidates count=%s current_user_id=%s", len(candidates), user_id
+                    )
+                candidate = candidates[0]
+                candidate_user_id = candidate["user_id"]
+                # Every link keeps the candidate as the primary account, so linking only ever merges the newer
+                # account into the older one. A candidate created after the current account exists because of a
+                # later signup with this e-mail (a social login that was not linked, or a password account
+                # registered afterwards, possibly by someone else). Merging the older account into it would move
+                # the identity, and everything the app keyed on it, into the newer account. So nothing is linked and
+                # the user signs in to the account she used. Equal or unknown dates keep the rules below.
+                if self._is_created_after(candidate, userinfo):
+                    _logger.info(
+                        "Account linking skipped, candidate is newer branch=search current_user_id=%s candidate_user_id=%s",
+                        user_id,
+                        candidate_user_id,
+                    )
+                    return {
+                        "is_pending_account_linking": False,
+                        "is_account_linked": False,
+                    }
+                if self._is_social_provider(current_account_provider):
+                    candidate_verified = self._is_verified(candidate)
+                    is_eligible_automatic_account_linking = (
+                        len(candidates) == 1
+                        and self._is_social_account(candidate)
+                        and candidate_verified
+                        and current_verified
+                    )
                     if is_eligible_automatic_account_linking:
-                        result = self._merge_and_link_accounts(
-                            existing_account_user_id, current_account_provider, user_id
+                        return self._link_automatically(
+                            request, session_data, candidate_user_id, current_account_provider, user_id, "search"
                         )
-                        session_data["userinfo"]["sub"] = existing_account["user_id"]
-                        session_data["refresh_token"] = AccountToken.objects.get(
-                            user_id=existing_account_user_id
-                        ).refresh_token
-                        self._store_session(request, session_data)
-                        AccountLinking.objects.update_or_create(
-                            primary_user_id=existing_account_user_id,
-                            secondary_provider=current_account_provider,
-                            secondary_user_id=user_id,
-                        )
-                        ConnectedAccount.objects.filter(
-                            Q(user_id_owner=existing_account_user_id) | Q(user_id_owner=user_id),
-                            provider=current_account_provider,
-                        ).update(is_account_linked=True)
-                        _logger.debug(
-                            "Merged and linked accounts for user %s. Returned result: %s",
-                            user_id,
-                            result,
-                        )
-                        return {
-                            "is_pending_account_linking": False,
-                            "is_account_linked": True,
-                        }
-                    else:
-                        provider_names = {
-                            "auth0": "email e senha",
-                            "google-oauth2": "Google",
-                            "facebook": "Facebook",
-                            "apple": "Apple",
-                        }
-                        request.session[self.SESSION_KEY_ACCOUNT_LINKING_TX] = {
-                            "primary_user_id": existing_account_user_id,
-                            "primary_provider": existing_account_provider,
-                            "primary_provider_friendly_name": provider_names[existing_account_provider],
-                            "primary_connection_name": existing_account["identities"][0]["connection"],
-                            "secondary_user_id": user_id,
-                            "secondary_provider": current_account_provider,
-                            "secondary_connection_name": userinfo["identities"][0]["connection"],
-                        }
-                        return {
-                            "is_pending_account_linking": True,
-                            "is_account_linked": False,
-                        }
+                    self._log_withheld(
+                        "search",
+                        user_id,
+                        candidate_user_id,
+                        self._primary_provider(candidate),
+                        current_verified,
+                        candidate_verified,
+                    )
+                return self._store_pending_linking(request, candidate, userinfo, user_id, current_account_provider)
         return {
             "is_pending_account_linking": False,
             "is_account_linked": False,
         }
+
+    def _link_automatically(
+        self,
+        request,
+        session_data: dict[str, Any],
+        primary_user_id: str,
+        secondary_provider: str,
+        secondary_user_id: str,
+        branch: str,
+    ) -> VerifyAccountLinkingResult:
+        from auth0_oauth_client.models import AccountLinking
+        from auth0_oauth_client.models import AccountToken
+        from auth0_oauth_client.models import ConnectedAccount
+
+        # The link response is the identities list and can carry `profileData` (e-mail, name): never log it.
+        self._merge_and_link_accounts(primary_user_id, secondary_provider, secondary_user_id)
+        session_data["userinfo"]["sub"] = primary_user_id
+        session_data["refresh_token"] = AccountToken.objects.get(user_id=primary_user_id).refresh_token
+        self._store_session(request, session_data)
+        AccountLinking.objects.update_or_create(
+            primary_user_id=primary_user_id,
+            secondary_provider=secondary_provider,
+            secondary_user_id=secondary_user_id,
+        )
+        ConnectedAccount.objects.filter(
+            Q(user_id_owner=primary_user_id) | Q(user_id_owner=secondary_user_id),
+            provider=secondary_provider,
+        ).update(is_account_linked=True)
+        _logger.info(
+            "Account linked automatically branch=%s primary_user_id=%s secondary_user_id=%s",
+            branch,
+            primary_user_id,
+            secondary_user_id,
+        )
+        return {
+            "is_pending_account_linking": False,
+            "is_account_linked": True,
+        }
+
+    def _store_pending_linking(
+        self,
+        request,
+        candidate: SearchUserResponseBody,
+        userinfo: UserDetailsPayload,
+        user_id: str,
+        current_provider: str,
+    ) -> VerifyAccountLinkingResult:
+        provider_names = {
+            "auth0": "e-mail e senha",
+            "google-oauth2": "Google",
+            "facebook": "Facebook",
+            "apple": "Apple",
+        }
+        candidate_identity = candidate["identities"][0]
+        candidate_provider = candidate_identity["provider"]
+        pending_account_linking: AccountLinkingPayload = {
+            "primary_user_id": candidate["user_id"],
+            "primary_provider": candidate_provider,
+            # A provider without a friendly name (e.g. a passwordless `email` connection) shows its raw name.
+            "primary_provider_friendly_name": provider_names.get(candidate_provider, candidate_provider),
+            "primary_connection_name": candidate_identity["connection"],
+            "secondary_user_id": user_id,
+            "secondary_provider": current_provider,
+            "secondary_connection_name": userinfo["identities"][0]["connection"],
+        }
+        request.session[self.SESSION_KEY_ACCOUNT_LINKING_TX] = pending_account_linking
+        return {
+            "is_pending_account_linking": True,
+            "is_account_linked": False,
+        }
+
+    def _log_withheld(
+        self,
+        branch: str,
+        current_user_id: str,
+        candidate_user_id: str,
+        candidate_provider: str | None,
+        current_verified: bool,
+        candidate_verified: bool | None,
+    ) -> None:
+        _logger.info(
+            "Automatic account linking withheld branch=%s current_user_id=%s candidate_user_id=%s "
+            "candidate_provider=%s current_email_verified=%s candidate_email_verified=%s",
+            branch,
+            current_user_id,
+            candidate_user_id,
+            candidate_provider,
+            current_verified,
+            candidate_verified,
+        )
 
     def pending_account_linking(self, request) -> AccountLinkingPayload | None:
         return request.session.get(self.SESSION_KEY_ACCOUNT_LINKING_TX)
@@ -572,23 +711,34 @@ class DjangoAuthClient:
         if cached is not None:
             return cached
 
-        _tokens = self._get_auth0_token_through_m2m()
-        _auth0 = Auth0(self.auth0_management_api_domain, _tokens["access_token"])
-        user_details = cast(UserDetailsPayload, _auth0.users.get(id=user_id))
+        user_details = self._get_user_by_id_uncached(user_id)
 
         cache.set(cache_key, user_details, timeout=60 * 60 * 24)
 
         return user_details
 
+    def _get_user_by_id_uncached(self, user_id: str) -> UserDetailsPayload:
+        """Read the user from the Management API. Never reads nor writes the `get_user_by_id` cache."""
+        _tokens = self._get_auth0_token_through_m2m()
+        _auth0 = Auth0(self.auth0_management_api_domain, _tokens["access_token"])
+        return cast(UserDetailsPayload, _auth0.users.get(id=user_id))
+
     def _search_users_excluding_connection(self, email: str, connection_name: str) -> list[SearchUserResponseBody]:
         _tokens = self._get_auth0_token_through_m2m()
         _auth0 = Auth0(self.auth0_management_api_domain, _tokens["access_token"])
-        q = f'email:"{email}" AND NOT identities.connection:"{connection_name}"'
-        fields = ["user_id", "identities.provider", "identities.connection"]
+        # Escaped, so that a value with `"` or `\` cannot close the term and add clauses of its own.
+        q = (
+            f'email:"{_escape_lucene_quoted_term(email)}" '
+            f'AND NOT identities.connection:"{_escape_lucene_quoted_term(connection_name)}"'
+        )
+        fields = ["user_id", "identities.provider", "identities.connection", "email", "email_verified", "created_at"]
         found_users = _auth0.users.list(q=q, fields=fields)["users"]
         # Sample output:
         # [
         #     {
+        #         "created_at": "2026-02-03T12:00:00.000Z",
+        #         "email": "user@example.com",
+        #         "email_verified": False,
         #         "identities": [{"connection": "Username-Password-Authentication", "provider": "auth0"}],
         #         "user_id": "auth0|69813210040e4b7128ed70f8",
         #     }
@@ -666,13 +816,58 @@ class DjangoAuthClient:
     def _is_social_provider(self, provider: str) -> bool:
         return provider in ("google-oauth2", "facebook", "apple")
 
+    def _is_verified(self, record: Mapping[str, object]) -> bool:
+        """Strict boolean: a missing, `None` or non-boolean `email_verified` is not verified."""
+        return record.get("email_verified") is True
+
+    def _primary_provider(self, record: Mapping[str, object]) -> str | None:
+        """Provider of `identities[0]`, which Auth0 documents as the primary identity."""
+        identities = record.get("identities")
+        if not isinstance(identities, list) or not identities:
+            return None
+        primary_identity = identities[0]
+        if not isinstance(primary_identity, dict):
+            return None
+        provider = primary_identity.get("provider")
+        return provider if isinstance(provider, str) else None
+
+    def _is_social_account(self, record: Mapping[str, object]) -> bool:
+        return self._is_social_provider(self._primary_provider(record) or "")
+
+    def _is_same_email(self, email: object, other_email: object) -> bool:
+        """Both are strings and equal ignoring case. Auth0 normalizes `email`, so its search is case-insensitive."""
+        return isinstance(email, str) and isinstance(other_email, str) and email.casefold() == other_email.casefold()
+
+    def _parse_created_at(self, value: object) -> datetime | None:
+        """Parse an Auth0 ISO-8601 `created_at`. `None` when absent, unparseable or naive, so that an aware value
+        is never compared with a naive one."""
+        if not isinstance(value, str):
+            return None
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+        if parsed.utcoffset() is None:
+            return None
+        return parsed
+
+    def _is_created_after(self, record: Mapping[str, object], reference: Mapping[str, object]) -> bool:
+        """`record` was created strictly after `reference`. `False` when either `created_at` is unknown."""
+        record_created_at = self._parse_created_at(record.get("created_at"))
+        reference_created_at = self._parse_created_at(reference.get("created_at"))
+        return (
+            record_created_at is not None
+            and reference_created_at is not None
+            and record_created_at > reference_created_at
+        )
+
     # endregion
 
     # region Token Management
 
     def get_access_token_for_connection(self, request, connection: str) -> GoogleTokenResult:
         refresh_token = self.get_refresh_token(request)
-        return self.get_access_token_for_connection(refresh_token, connection)
+        return self.get_access_token_for_connection_using_user_refresh_token(refresh_token, connection)
 
     def get_access_token_for_connection_using_user_refresh_token(
         self, refresh_token, connection: str
