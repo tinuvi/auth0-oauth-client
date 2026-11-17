@@ -631,10 +631,12 @@ class DjangoAuthClient:
             "apple": "Apple",
         }
         candidate_identity = candidate["identities"][0]
+        candidate_provider = candidate_identity["provider"]
         pending_account_linking: AccountLinkingPayload = {
             "primary_user_id": candidate["user_id"],
-            "primary_provider": candidate_identity["provider"],
-            "primary_provider_friendly_name": provider_names[candidate_identity["provider"]],
+            "primary_provider": candidate_provider,
+            # A provider without a friendly name (e.g. a passwordless `email` connection) shows its raw name.
+            "primary_provider_friendly_name": provider_names.get(candidate_provider, candidate_provider),
             "primary_connection_name": candidate_identity["connection"],
             "secondary_user_id": user_id,
             "secondary_provider": current_provider,

@@ -956,6 +956,14 @@ class VerifyAccountLinkingTest(TransactionTestCase):
 
                     self._assert_manual_path(outcome, self.FACEBOOK_USER_ID, "facebook", "Facebook")
 
+    def test_candidate_provider_without_friendly_name_uses_the_raw_provider(self):
+        # A passwordless `email` connection has no friendly name; the pending path must not raise.
+        candidate = _candidate_record("email|existing", "email")
+
+        outcome = self._verify(_current_record(), [candidate])
+
+        self._assert_manual_path(outcome, "email|existing", "email", "email")
+
     def test_multiple_candidates_never_link_automatically(self):
         candidates = [
             _candidate_record("facebook|first", "facebook"),
