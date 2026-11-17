@@ -753,6 +753,27 @@ class VerifyAccountLinkingTest(TransactionTestCase):
             logs, [("INFO", self.AUTO_LINK_MESSAGE, ("connected_account", owner_user_id, self.GOOGLE_USER_ID))]
         )
 
+    def test_connected_account_links_older_verified_social_owner(self):
+        owner_user_id = "facebook|owner"
+        row = self._create_connected_account(owner_user_id)
+        AccountToken.objects.create(user_id=owner_user_id, refresh_token="rt_owner")
+        current = _current_record(created_at="2026-11-17T09:30:00.000Z")
+        owner = _owner_record("facebook", created_at="2026-06-01T12:00:00.000Z")
+
+        with self.assertLogs("auth0_oauth_client", "DEBUG") as logs:
+            outcome = self._verify(current, owner=owner)
+
+        self.assertEqual(outcome.result, self.LINKED)
+        outcome.owner_read.assert_called_once_with(owner_user_id)
+        outcome.merge.assert_called_once_with(owner_user_id, "google-oauth2", self.GOOGLE_USER_ID)
+        outcome.search.assert_not_called()
+        row.refresh_from_db()
+        self.assertTrue(row.is_account_linked)
+        self.assertEqual(outcome.session[DjangoAuthClient.SESSION_KEY_STATE]["userinfo"]["sub"], owner_user_id)
+        self._assert_logged(
+            logs, [("INFO", self.AUTO_LINK_MESSAGE, ("connected_account", owner_user_id, self.GOOGLE_USER_ID))]
+        )
+
     def test_connected_account_newer_owner_is_never_linked(self):
         # The owner stays primary, so a verified social owner created after the current account is not linked.
         owner_user_id = "facebook|owner"

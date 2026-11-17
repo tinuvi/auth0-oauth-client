@@ -508,7 +508,9 @@ class DjangoAuthClient:
                 try:
                     owner = self._get_user_by_id_uncached(owner_user_id)
                 except Auth0Error as exc:
-                    # For example 404 for an owner deleted in Auth0, 429 or 5xx. Never a link, never a failed login.
+                    # An Auth0 API error (for example 404 for an owner deleted in Auth0, 429 or 5xx) never links and
+                    # never fails the login. A network error (requests ConnectionError or Timeout, which auth0-python
+                    # does not wrap) propagates, like on the other Management API calls.
                     _logger.warning(
                         "Account linking owner read failed branch=connected_account candidate_user_id=%s "
                         "status_code=%s",
@@ -521,7 +523,7 @@ class DjangoAuthClient:
                 owner is not None
                 and self._is_social_account(owner)
                 and self._is_same_email(owner.get("email"), user_email)
-                and owner_verified is True
+                and owner_verified
                 and not self._is_created_after(owner, userinfo)
             )
             if is_eligible_automatic_account_linking:
