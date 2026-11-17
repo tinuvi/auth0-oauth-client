@@ -489,31 +489,37 @@ class DjangoAuthClient:
         )
         if connected_account_entry is not None:
             owner_user_id = connected_account_entry.user_id_owner
-            owner = self._get_user_by_id_uncached(owner_user_id)
-            owner_email = owner.get("email")
-            owner_verified = self._is_verified(owner)
-            is_same_email = (
-                isinstance(owner_email, str)
-                and isinstance(user_email, str)
-                and owner_email.casefold() == user_email.casefold()
-            )
+            owner: UserDetailsPayload | None = None
+            # Only a verified social login can be linked automatically, so the owner is read only for one.
+            if self._is_social_provider(current_account_provider) and current_verified:
+                try:
+                    owner = self._get_user_by_id_uncached(owner_user_id)
+                except Auth0Error as exc:
+                    # For example 404 for an owner deleted in Auth0, 429 or 5xx. Never a link, never a failed login.
+                    _logger.warning(
+                        "Account linking owner read failed branch=connected_account candidate_user_id=%s "
+                        "status_code=%s",
+                        owner_user_id,
+                        exc.status_code,
+                    )
+            owner_verified = self._is_verified(owner) if owner is not None else None
             is_eligible_automatic_account_linking = (
-                self._is_social_provider(current_account_provider)
+                owner is not None
                 and self._is_social_account(owner)
-                and is_same_email
-                and owner_verified
-                and current_verified
+                and self._is_same_email(owner.get("email"), user_email)
+                and owner_verified is True
             )
             if is_eligible_automatic_account_linking:
                 return self._link_automatically(
                     request, session_data, owner_user_id, current_account_provider, user_id, "connected_account"
                 )
-            # The row is left untouched and the search branch decides, exactly as if no row had matched.
+            # The row is left untouched and the search branch decides, exactly as if no row had matched. An owner
+            # that was not read is logged with an unknown (`None`) provider and verification.
             self._log_withheld(
                 "connected_account",
                 user_id,
                 owner_user_id,
-                self._primary_provider(owner),
+                self._primary_provider(owner) if owner is not None else None,
                 current_verified,
                 owner_verified,
             )
@@ -655,7 +661,7 @@ class DjangoAuthClient:
         candidate_user_id: str,
         candidate_provider: str | None,
         current_verified: bool,
-        candidate_verified: bool,
+        candidate_verified: bool | None,
     ) -> None:
         _logger.info(
             "Automatic account linking withheld branch=%s current_user_id=%s candidate_user_id=%s "
@@ -798,6 +804,10 @@ class DjangoAuthClient:
 
     def _is_social_account(self, record: Mapping[str, object]) -> bool:
         return self._is_social_provider(self._primary_provider(record) or "")
+
+    def _is_same_email(self, email: object, other_email: object) -> bool:
+        """Both are strings and equal ignoring case. Auth0 normalizes `email`, so its search is case-insensitive."""
+        return isinstance(email, str) and isinstance(other_email, str) and email.casefold() == other_email.casefold()
 
     def _parse_created_at(self, value: object) -> datetime | None:
         """Parse an Auth0 ISO-8601 `created_at`. `None` when absent, unparseable or naive, so that an aware value

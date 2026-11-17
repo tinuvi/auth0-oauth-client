@@ -11,6 +11,7 @@ import jwt
 import requests
 
 from auth0.exceptions import Auth0Error
+from auth0.exceptions import RateLimitError
 from django.core.cache import cache
 from django.test import RequestFactory
 from django.test import TestCase
@@ -567,6 +568,9 @@ class VerifyAccountLinkingTest(TransactionTestCase):
         "Account linking skipped, candidate is newer branch=search current_user_id=%s candidate_user_id=%s"
     )
     MULTIPLE_CANDIDATES_MESSAGE = "Multiple account linking candidates count=%s current_user_id=%s"
+    OWNER_READ_FAILED_MESSAGE = (
+        "Account linking owner read failed branch=connected_account candidate_user_id=%s status_code=%s"
+    )
     NOT_LINKED = {"is_pending_account_linking": False, "is_account_linked": False}
     PENDING = {"is_pending_account_linking": True, "is_account_linked": False}
     LINKED = {"is_pending_account_linking": False, "is_account_linked": True}
@@ -580,7 +584,7 @@ class VerifyAccountLinkingTest(TransactionTestCase):
         request.session[DjangoAuthClient.SESSION_KEY_STATE] = _make_session_data(user_id=user_id, email=LINKING_EMAIL)
         return client, request
 
-    def _verify(self, current, candidates=(), user_id=GOOGLE_USER_ID, owner=None):
+    def _verify(self, current, candidates=(), user_id=GOOGLE_USER_ID, owner=None, owner_error=None):
         """Run `verify_account_linking` with every Auth0 boundary replaced, and return what it touched."""
         client, request = self._setup_client_and_request(user_id=user_id)
         with (
@@ -588,7 +592,9 @@ class VerifyAccountLinkingTest(TransactionTestCase):
             patch.object(
                 DjangoAuthClient, "_search_users_excluding_connection", return_value=list(candidates)
             ) as mock_search,
-            patch.object(DjangoAuthClient, "_get_user_by_id_uncached", return_value=owner) as mock_owner_read,
+            patch.object(
+                DjangoAuthClient, "_get_user_by_id_uncached", return_value=owner, side_effect=owner_error
+            ) as mock_owner_read,
             patch.object(DjangoAuthClient, "_merge_and_link_accounts", return_value=[]) as mock_merge,
             patch.object(DjangoAuthClient, "_link_user_accounts") as mock_link,
         ):
@@ -795,11 +801,80 @@ class VerifyAccountLinkingTest(TransactionTestCase):
         owner_user_id = "facebook|owner"
         row = self._create_connected_account(owner_user_id)
 
-        outcome = self._verify(_current_record(email_verified=False), owner=_owner_record("facebook"))
+        with self.assertLogs("auth0_oauth_client", "DEBUG") as logs:
+            outcome = self._verify(_current_record(email_verified=False), owner=_owner_record("facebook"))
 
         self.assertEqual(outcome.result, self.NOT_LINKED)
         self._assert_not_linked(outcome, self.GOOGLE_USER_ID)
+        # An unverified login can never be linked automatically, so the owner is not even read.
+        outcome.owner_read.assert_not_called()
         outcome.search.assert_called_once_with(LINKING_EMAIL, "google-oauth2")
+        row.refresh_from_db()
+        self.assertFalse(row.is_account_linked)
+        self._assert_logged(
+            logs,
+            [
+                (
+                    "INFO",
+                    self.WITHHELD_MESSAGE,
+                    ("connected_account", self.GOOGLE_USER_ID, owner_user_id, None, False, None),
+                )
+            ],
+        )
+
+    def test_connected_account_owner_read_failure_falls_through_to_search(self):
+        owner_user_id = "facebook|owner"
+        row = self._create_connected_account(owner_user_id)
+        errors = {
+            "rate limited": RateLimitError(error_code="too_many_requests", message="Too Many Requests", reset_at=0),
+            "server error": Auth0Error(status_code=503, error_code="temporarily_unavailable", message="Unavailable"),
+        }
+        for label, error in errors.items():
+            with self.subTest(label):
+                with self.assertLogs("auth0_oauth_client", "DEBUG") as logs:
+                    outcome = self._verify(_current_record(), owner_error=error)
+
+                self.assertEqual(outcome.result, self.NOT_LINKED)
+                self._assert_not_linked(outcome, self.GOOGLE_USER_ID)
+                outcome.owner_read.assert_called_once_with(owner_user_id)
+                outcome.search.assert_called_once_with(LINKING_EMAIL, "google-oauth2")
+                row.refresh_from_db()
+                self.assertFalse(row.is_account_linked)
+                self._assert_logged(
+                    logs,
+                    [
+                        ("WARNING", self.OWNER_READ_FAILED_MESSAGE, (owner_user_id, error.status_code)),
+                        (
+                            "INFO",
+                            self.WITHHELD_MESSAGE,
+                            ("connected_account", self.GOOGLE_USER_ID, owner_user_id, None, True, None),
+                        ),
+                    ],
+                )
+
+    @patch.object(DjangoAuthClient, "_get_auth0_token_through_m2m", return_value={"access_token": "m2m_at"})
+    @patch("auth0_oauth_client.client.Auth0")
+    def test_connected_account_owner_deleted_in_auth0_falls_through_to_search(self, mock_auth0_cls, mock_m2m):
+        # A row whose owner no longer exists: the Management API answers 404, which auth0-python raises as
+        # Auth0Error. The login goes on through the search branch instead of failing.
+        owner_user_id = "auth0|deleted-owner"
+        row = self._create_connected_account(owner_user_id)
+        mock_auth0_cls.return_value.users.get.side_effect = Auth0Error(
+            status_code=404, error_code="inexistent_user", message="The user does not exist."
+        )
+        cache.set(f"_auth0_oauth_client_user_{self.GOOGLE_USER_ID}", _current_record())
+        client, request = self._setup_client_and_request(user_id=self.GOOGLE_USER_ID)
+
+        with (
+            patch.object(DjangoAuthClient, "_search_users_excluding_connection", return_value=[]) as mock_search,
+            patch.object(DjangoAuthClient, "_merge_and_link_accounts", return_value=[]) as mock_merge,
+        ):
+            result = client.verify_account_linking(request)
+
+        self.assertEqual(result, self.NOT_LINKED)
+        mock_auth0_cls.return_value.users.get.assert_called_once_with(id=owner_user_id)
+        mock_search.assert_called_once_with(LINKING_EMAIL, "google-oauth2")
+        mock_merge.assert_not_called()
         row.refresh_from_db()
         self.assertFalse(row.is_account_linked)
 
@@ -834,6 +909,7 @@ class VerifyAccountLinkingTest(TransactionTestCase):
 
         self.assertEqual(outcome.result, self.NOT_LINKED)
         self._assert_not_linked(outcome, current_user_id)
+        outcome.owner_read.assert_not_called()
         outcome.search.assert_called_once_with(LINKING_EMAIL, PASSWORD_CONNECTION)
         row.refresh_from_db()
         self.assertFalse(row.is_account_linked)
