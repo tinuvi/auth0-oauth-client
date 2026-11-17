@@ -127,6 +127,8 @@ class UserDetailsPayload(TypedDict, total=False):
 class SearchUserResponseBody(TypedDict):
     identities: list[IdentityResponseBody]
     user_id: str
+    email_verified: NotRequired[bool]
+    created_at: NotRequired[str]
 
 
 class AccountLinkingPayload(TypedDict):
